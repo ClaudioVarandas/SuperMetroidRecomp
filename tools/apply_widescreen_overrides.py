@@ -203,6 +203,23 @@ FUNC_RE = re.compile(
     re.MULTILINE,
 )
 
+_SHARD_RE = re.compile(r"^(bank[0-9a-f]+)(?:_part[0-9a-f]+)?_v2\.c$", re.I)
+
+
+def source_bank(filename: str) -> str:
+    """Reduce a generated source file name to the guest bank it holds.
+
+    v2_emit shards a large bank across bank<NN>_part<MM>_v2.c files, and where
+    the split falls is an emitter implementation detail that moves with total
+    emitted size -- an unrelated codegen change elsewhere can push a bank over
+    the threshold and relocate functions that did not themselves change. The
+    residual-risk audit below cares which BANK a risky function lives in, not
+    which shard file, so normalize before comparing. A function that actually
+    moves bank, or changes shape, still trips the audit.
+    """
+    match = _SHARD_RE.match(filename)
+    return match.group(1).lower() if match else filename
+
 
 def function_extent(text: str, start: int) -> tuple[int, int]:
     brace = text.find("{", start)
@@ -513,7 +530,7 @@ def verify_residual_camera_x_risk(gen_dir: Path) -> int:
                 "branches": 0,
                 "native": 0,
             })
-            rec["files"].add(path.name)  # type: ignore[union-attr]
+            rec["files"].add(source_bank(path.name))  # type: ignore[union-attr]
             rec["variants"] += 1  # type: ignore[operator]
             rec["ff"] += ff_masks  # type: ignore[operator]
             rec["fe"] += fe_masks  # type: ignore[operator]
@@ -523,7 +540,7 @@ def verify_residual_camera_x_risk(gen_dir: Path) -> int:
 
     expected = {
         name: {
-            "files": {spec[0]},
+            "files": {source_bank(spec[0])},
             "variants": spec[1],
             "ff": spec[2],
             "fe": spec[3],

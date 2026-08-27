@@ -12,7 +12,15 @@ project(SuperMetroidSNESRecomp C)
 
 set(CMAKE_C_STANDARD 11)
 
-set(SNESRECOMP_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/snesrecomp)
+# CACHE PATH, so -DSNESRECOMP_ROOT=<engine checkout> works -- the framework
+# README documents that flag as the way to build a game against an engine
+# worktree. A plain set() here created a normal variable that SHADOWED the
+# cache entry, so the override was accepted and then silently ignored: the
+# build linked this repo's pinned snesrecomp against C emitted by a DIFFERENT
+# engine, which surfaces as undefined runner symbols at link time rather than
+# as a clear "wrong engine" error. SMW and MMX already use this form.
+set(SNESRECOMP_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/snesrecomp" CACHE PATH
+    "Path to the snesrecomp checkout used by this game")
 
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
 
@@ -59,7 +67,12 @@ include(${SNESRECOMP_ROOT}/runner/runner.cmake)
 # consumed as the ./recomp-ui junction/submodule) so every recomp game drives
 # ONE launcher repo. The former in-tree launcher_ng has been retired from the
 # engine in favour of this shared, console-agnostic launcher.
-include(${CMAKE_CURRENT_SOURCE_DIR}/recomp-ui/recomp_ui.cmake)
+# CACHE PATH for the same reason as SNESRECOMP_ROOT: a debug worktree, or a
+# build pinned against a specific launcher revision, needs to point this
+# somewhere other than the in-tree submodule.
+set(RECOMP_UI_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/recomp-ui" CACHE PATH
+    "Path to the shared recomp-ui checkout used by this game")
+include(${RECOMP_UI_ROOT}/recomp_ui.cmake)
 
 # On Android the SDL2 target comes from the sibling add_subdirectory(SDL) in
 # android/app/jni/CMakeLists.txt, and rendering goes through SDL_Renderer on
@@ -68,10 +81,17 @@ if(NOT ANDROID)
     find_package(OpenGL REQUIRED)
 endif()
 # Generated recompiler output (produced by tools/regen.sh; not committed).
-file(GLOB SM_GEN_SOURCES CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/src/gen/*.c)
+#
+# SM_GEN_DIR is overridable so a build can be pointed at generated C emitted by
+# a DIFFERENT engine revision without disturbing this repo's src/gen. That is
+# what an engine A/B needs: same sources, same flags, two emits. SMK and F-Zero
+# already expose the same knob.
+set(SM_GEN_DIR "${CMAKE_CURRENT_SOURCE_DIR}/src/gen" CACHE PATH
+    "Directory containing the private generated Super Metroid C sources")
+file(GLOB SM_GEN_SOURCES CONFIGURE_DEPENDS ${SM_GEN_DIR}/*.c)
 if(NOT SM_GEN_SOURCES)
     message(FATAL_ERROR
-        "src/gen/ is empty — run the regen (see header) with a verified "
+        "${SM_GEN_DIR} is empty — run the regen (see header) with a verified "
         "Super Metroid ROM at the repo root before building.")
 endif()
 
@@ -81,7 +101,7 @@ endif()
 add_custom_target(sm_widescreen_overrides ALL
     COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tools/apply_widescreen_overrides.py
-            --check --gen-dir ${CMAKE_CURRENT_SOURCE_DIR}/src/gen
+            --check --gen-dir ${SM_GEN_DIR}
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
     COMMENT "Applying Super Metroid widescreen enemy range overrides"
     VERBATIM
