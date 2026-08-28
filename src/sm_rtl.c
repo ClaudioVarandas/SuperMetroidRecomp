@@ -171,6 +171,40 @@ void RunOneFrameOfGame(void) {
       }
     }
 
+    /* Diagnostic (SM_LLE_RESUME_DIAG): g_lle_resume_pc is the host's ONLY
+     * continuation handle into the guest. A healthy frame always comes back
+     * to WaitForNMI's $80:8343 spin, so a resume PC that stops advancing means
+     * the guest is parked and every subsequent frame is re-entering the same
+     * place with the same state. That is invisible from WRAM state alone. */
+    {
+      static uint32_t s_prev_entry = 0xFFFFFFFFu;
+      static unsigned s_same = 0;
+      static int s_diag = -1;
+      if (s_diag < 0) {
+        const char *v = getenv("SM_LLE_RESUME_DIAG");
+        s_diag = (v && v[0] && v[0] != '0');
+      }
+      if (s_diag) {
+        if (entry_pc == s_prev_entry) {
+          if (++s_same == 8u || (s_same % 300u) == 0u)
+            fprintf(stderr,
+                    "[sm_lle] resume PC STUCK at $%06X for %u frames "
+                    "(S=%04X DB=%02X P=%02X gs=%02X)\n",
+                    (unsigned)entry_pc, s_same, (unsigned)g_cpu.S,
+                    (unsigned)g_cpu.DB, (unsigned)g_cpu.P,
+                    (unsigned)g_ram[0x0998]);
+        } else {
+          if (s_same >= 8u)
+            fprintf(stderr,
+                    "[sm_lle] resume PC advanced $%06X -> $%06X after %u "
+                    "frames\n",
+                    (unsigned)s_prev_entry, (unsigned)entry_pc, s_same);
+          s_same = 0;
+          s_prev_entry = entry_pc;
+        }
+      }
+    }
+
     if (!interp_bridge_run_loop(&g_cpu, entry_pc, 0x808343u, 0x05B4u, 1)) {
       fprintf(stderr, "[sm_rtl] LLE loop bailed at entry $%06X\n",
               (unsigned)entry_pc);

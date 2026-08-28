@@ -772,7 +772,18 @@ void recomp_post_mortem_dump(const char *reason, void *fault_info) {
     CpuDispatchLogDumpJson(f);
     Tier2CoverageDumpJson(f);
     ppudma_dump_json(f);
-    dump_trace_recent_json(f, 256);
+    /* Retained-trace depth. 256 covers only ~11 frames, which is useless for
+     * a stall that has to be read BACKWARD to the last main-thread activity.
+     * Overridable so an investigation can widen it without a rebuild. */
+    {
+        int trace_n = 256;
+        const char *tn = getenv("SNESRECOMP_POSTMORTEM_TRACE_N");
+        if (tn && *tn) {
+            long v = strtol(tn, NULL, 0);
+            if (v > 0 && v <= 2000000) trace_n = (int)v;
+        }
+        dump_trace_recent_json(f, trace_n);
+    }
     dump_dbpb_recent_json(f);
     dump_tripwires_json(f);
     dump_all_threads_json(f, fault_info);
