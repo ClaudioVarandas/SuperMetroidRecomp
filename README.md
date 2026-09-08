@@ -33,11 +33,44 @@ The default LLE-first build boots, renders, plays audio, completes the attract
 demo, starts a new game, traverses doors, pauses, and saves at Samus's ship.
 It remains a work in progress and needs broader end-to-end regression testing.
 
-## Build
+## Screenshots
+
+Custom widescreen at the landing site, with energy and the minimap anchored
+to the outer edges:
+
+![Super Metroid landing site rendered in ultrawide with edge-anchored HUD](docs/images/widescreen-landing-site.png)
+
+Tourian gameplay with energy and reserves on the left, weapons centered,
+and the minimap on the right:
+
+![Super Metroid Tourian gameplay with the widescreen renderer and populated HUD](docs/images/widescreen-tourian.jpg)
+
+Screenshots supplied by the project owner from the custom-renderer build.
+
+## Windows and Linux releases
+
+Download the Windows x64 ZIP or Linux x86_64 AppImage from this repository's
+Releases page. Extract the entire Windows ZIP before launching the executable;
+its DLLs and `assets/` directory are required. On Linux, make the AppImage
+executable and launch it. Supply your own unmodified Super Metroid (Japan, USA)
+ROM; no ROM or saved progress is included in either package.
+
+Open **Mods** in the launcher to enable **Widescreen** (Fit, 16:9, 21:9 or 32:9)
+and choose edge-anchored or centered HUD placement. **Presentation FPS** is a
+separate mod with Auto and fixed frame-rate targets. Both are off by default;
+turning both off uses stock rendering. Game logic retains its native timing.
+These features are experimental: full-game visual fidelity is not certified,
+and achievable FPS depends on hardware and the scene.
+
+Settings and saves live beside the executable/AppImage. Keep that directory
+writable, and preserve your settings and `saves/` when updating. The detailed
+implementation and validation record is in `docs/custom-renderer.md`.
+
+## Building from source
 
 Prerequisites: a `snesrecomp` checkout at `./snesrecomp` (junction/symlink
 to the sibling repo, pinned in `snesrecomp.pin`), a verified Super Metroid
-ROM at the repo root, SDL2 + OpenGL, and the mingw64 toolchain (cmake,
+ROM at the repo root, SDL3 + OpenGL, and the mingw64 toolchain (cmake,
 gcc, ninja) on `PATH`. Regeneration also requires `rustup`; it builds and
 requires the fast native analyzer by default. Set
 `SNESRECOMP_ANALYSIS_BACKEND=python` only to use the slower reference path.
@@ -48,7 +81,7 @@ requires the fast native analyzer by default. Set
 git clone --depth 1 https://github.com/snesrev/sm.git refs/snesrev-sm
 python tools/ingest_sm_decomp.py   # funcs -> recomp/*.cfg; tables -> recomp/sm_decomp_symbols.json
 
-# 2. deterministic profile + override-root regeneration. Strict mode
+# 2. deterministic profile-scoped regeneration (no guest widescreen hooks). Strict mode
 #    independently regenerates and requires byte-identical output.
 ./tools/regen.sh --strict-idempotent
 

@@ -87,6 +87,9 @@ New-Item -ItemType Directory -Path $stage -Force | Out-Null
 
 Copy-Item -LiteralPath $exe -Destination $stage
 Copy-Item -LiteralPath (Join-Path $root 'README.md') -Destination $stage
+[void](New-Item -ItemType Directory -Path (Join-Path $stage 'docs') -Force)
+Copy-Item -LiteralPath (Join-Path $root 'docs\custom-renderer.md') -Destination (Join-Path $stage 'docs')
+Copy-Item -LiteralPath (Join-Path $root 'docs\images') -Destination (Join-Path $stage 'docs') -Recurse
 Copy-Item -LiteralPath $assets -Destination $stage -Recurse
 # Release-owned mod catalog, when the build stages one. Ships as a nested
 # directory tree, which is exactly what made portable ZIP entry names matter
@@ -128,6 +131,38 @@ foreach ($name in $runtimeDlls) {
     throw "Required MinGW runtime DLL missing: $source"
   }
   Copy-Item -LiteralPath $source -Destination $stage
+}
+
+# Follow transitive MinGW imports too. In particular, current SDL3 builds
+# import libiconv-2.dll, which a developer's PATH can silently supply while
+# the shipped ZIP fails with STATUS_DLL_NOT_FOUND on a clean machine.
+$objdump = Join-Path $RuntimeBinDir 'objdump.exe'
+if (-not (Test-Path -LiteralPath $objdump)) {
+  throw "Dependency auditor missing: $objdump"
+}
+$pending = [Collections.Generic.Queue[string]]::new()
+$seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+Get-ChildItem -LiteralPath $stage -File | Where-Object { $_.Extension -in '.exe', '.dll' } |
+  ForEach-Object { $pending.Enqueue($_.FullName) }
+while ($pending.Count) {
+  $binary = $pending.Dequeue()
+  if (-not $seen.Add($binary)) { continue }
+  $imports = & $objdump -p $binary
+  if ($LASTEXITCODE -ne 0) { throw "Unable to inspect imports: $binary" }
+  foreach ($line in $imports) {
+    if ($line -notmatch 'DLL Name:\s*(\S+)') { continue }
+    $dependency = $Matches[1]
+    $bundled = Join-Path $stage $dependency
+    if (Test-Path -LiteralPath $bundled) { continue }
+    $runtime = Join-Path $RuntimeBinDir $dependency
+    if (Test-Path -LiteralPath $runtime) {
+      Copy-Item -LiteralPath $runtime -Destination $bundled
+      $pending.Enqueue($bundled)
+    } elseif ($dependency -notmatch '^(api-ms-|ext-ms-)' -and
+              -not (Test-Path -LiteralPath (Join-Path "$env:SystemRoot\System32" $dependency))) {
+      throw "Unresolved runtime import $dependency in $binary"
+    }
+  }
 }
 
 Add-Type -AssemblyName System.IO.Compression

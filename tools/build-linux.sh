@@ -30,7 +30,7 @@
 # Usage:
 #   bash tools/build-linux.sh                  # prod AppImage (default)
 #   bash tools/build-linux.sh --version 0.10.0 # stamp + name a release build
-# #   bash tools/build-linux.sh --config debug   # debug build (TCP server + rings)
+#   bash tools/build-linux.sh --config debug   # debug build (TCP server + rings)
 #   bash tools/build-linux.sh --regen          # regen src/gen first (tools/regen.sh)
 #   bash tools/build-linux.sh --run            # launch the AppImage after building
 #   bash tools/build-linux.sh --no-package     # configure + build only, skip AppImage
@@ -41,8 +41,8 @@
 # -O3. On a memory-constrained host, too many concurrent jobs makes the compiler
 # die with no diagnostic. Lower --jobs before suspecting the sources.
 #
-# The widescreen object-lifecycle hooks are NOT handled here: CMakeLists.txt owns
-# and Windows builds get an identical generated tree by construction.
+# Widescreen is a host custom renderer; generation never adds guest widening
+# hooks. Windows and Linux consume the same generated guest source tree.
 #
 # Prereqs: cmake, a C/C++ toolchain, SDL3 (or SNESRECOMP_SDL_BACKEND=SDL2 with
 # libsdl2-dev), libgl1-mesa-dev. linuxdeploy/appimagetool are fetched into the
@@ -61,8 +61,8 @@ PREBUILD_CMD=""
 POSTBUILD_CMD=""
 BOXART="recomp/launcher/boxart.tga"          # AppImage icon source (optional)
 EXTRA_PAYLOAD=()                             # repo-relative files -> usr/bin/
-# No release-owned mod catalog: widescreen is incomplete on this title and is
-# deliberately not shipped as a mod, so there is nothing to require here.
+# Widescreen and presentation FPS use the compiled-in Mods provider. They do
+# not need external package manifests staged alongside the executable.
 REQUIRED_MOD_MANIFESTS=()
 PROD_CMAKE_FLAGS=( -DSNESRECOMP_ENABLE_TRACE=OFF )
 DEBUG_CMAKE_FLAGS=( -DSNESRECOMP_ENABLE_TRACE=ON )
