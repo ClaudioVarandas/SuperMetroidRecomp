@@ -7,6 +7,7 @@
 #include "glsl_shader.h"
 #include "config.h"
 #include "sm_display.h"
+#include "sm_video.h"
 
 #define CODE(...) #__VA_ARGS__
 
@@ -40,7 +41,7 @@ static bool OpenGLRenderer_Init(SDL_Window *window) {
   SDL_GLContext context = SDL_GL_CreateContext(window);
   (void)context;
 
-  SDL_GL_SetSwapInterval(1);
+  SDL_GL_SetSwapInterval(g_sm_video.fps_enabled || g_config.disable_frame_delay ? 0 : 1);
   ogl_LoadFunctions();
 
   if (!ogl_IsVersionGEQ(3, 3))

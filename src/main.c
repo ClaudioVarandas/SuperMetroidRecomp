@@ -40,6 +40,12 @@
 #include "framedump.h"
 #include "config.h"
 #include "sm_display.h"
+#include "sm_renderer.h"
+#include "sm_video.h"
+#include "crc32.h"
+#if defined(RECOMP_LAUNCHER)
+#include "sm_mods.h"
+#endif
 #include "util.h"
 #include "sm_spc_player.h"
 
@@ -65,11 +71,6 @@
 #include "host_report.h"
 #include "widescreen.h"
 
-void SmWidescreenPrefillRoomMargins(int camera_x, int camera_y,
-                                    int layer2_x, int layer2_y,
-                                    int left_pixels, int right_pixels);
-void SmWidescreenGetSideSpace(int camera_x, int camera_y, int max_extra,
-                              int *left_pixels, int *right_pixels);
 
 typedef struct GamepadInfo {
   uint32 modifiers;
@@ -149,6 +150,60 @@ static bool g_display_perf;
 static int g_curr_fps;
 static int g_ppu_render_flags = 0;
 static int g_snes_width, g_snes_height;
+static SmViewport g_sm_viewport;
+static uint32_t g_sm_output[SM_MAX_WIDTH * SM_HEIGHT];
+static double g_sm_alpha = 1;
+static bool g_sm_reset_clock;
+static const char *kSmVideoConfig = "sm-video.ini";
+static bool SmCustomRendererEnabled(void) {
+  return g_sm_video.enhanced || g_sm_video.fps_enabled;
+}
+static double SmMonotonicSeconds(void) {
+  return (double)SDL_GetPerformanceCounter() / SDL_GetPerformanceFrequency();
+}
+/* Opt-in wall-time diagnostics. No guest state is sampled or changed here.
+ * Values include preemption/lock waits and are not CPU-time measurements. */
+enum { kSmProfileGuest, kSmProfileRaster, kSmProfileAcquire,
+       kSmProfileCompose, kSmProfilePresent, kSmProfileTrace, kSmProfileCount };
+static bool g_sm_profile;
+static unsigned g_sm_profile_frame;
+static struct { double total, maximum; unsigned count, maximum_frame; } g_sm_timings[kSmProfileCount];
+static double SmProfileStart(void) {
+  return g_sm_profile ? SmMonotonicSeconds() : 0;
+}
+static void SmProfileEnd(unsigned stage, double start) {
+  if (!g_sm_profile) return;
+  double elapsed = SmMonotonicSeconds() - start;
+  g_sm_timings[stage].total += elapsed;
+  if (elapsed > g_sm_timings[stage].maximum) {
+    g_sm_timings[stage].maximum = elapsed;
+    g_sm_timings[stage].maximum_frame = g_sm_profile_frame;
+  }
+  ++g_sm_timings[stage].count;
+}
+static void SmWaitUntil(double deadline) {
+  /* Same short deadline wait used by F-Zero. A fixed 1ms sleep on every
+   * presentation-only iteration unnecessarily overshoots near deadlines. */
+  double now = SmMonotonicSeconds();
+  while (now < deadline) {
+    double remaining_ms = (deadline - now) * 1000;
+    if (remaining_ms > 1.5)
+      SDL_Delay((Uint32)(remaining_ms - 0.5));
+    else
+      SDL_Delay(0);
+    now = SmMonotonicSeconds();
+  }
+}
+static double SmDisplayRefresh(void) {
+#if SNESRECOMP_SDL3
+  const SDL_DisplayMode *mode = SDL_GetCurrentDisplayMode(SDL_GetDisplayForWindow(g_window));
+  return mode ? mode->refresh_rate : 60;
+#else
+  SDL_DisplayMode mode;
+  return SDL_GetCurrentDisplayMode(SDL_GetWindowDisplayIndex(g_window), &mode) == 0
+      ? mode.refresh_rate : 60;
+#endif
+}
 static int g_last_drawable_width, g_last_drawable_height;
 static const char *g_active_config_file;
 static int g_sdl_audio_mixer_volume = SNESRECOMP_SDL_MIX_MAXVOLUME;
@@ -172,48 +227,20 @@ static void SmDisplay_PreparePpuFrame(void) {
     drawable_height = g_last_drawable_height;
   }
 
-  int width = SmDisplay_ComputeFrameWidth(drawable_width, drawable_height,
-                                          g_config.widescreen);
-  g_snes_width = width;
-  g_ws_extra = (width - 256) / 2;
-  g_ws_active = g_ws_extra != 0;
-  g_new_ppu = g_ws_active ||
-              (g_ppu_render_flags & kPpuRenderFlags_NewRenderer) != 0;
-  if (g_config.no_sprite_limits || g_ws_active)
+  g_sm_viewport = SmCalculateViewport(&g_sm_video, drawable_width, drawable_height);
+  g_snes_width = g_sm_viewport.width;
+  /* Legacy engine/guest widescreen hooks must never activate. */
+  g_ws_extra = 0;
+  g_ws_active = false;
+  g_new_ppu = (g_ppu_render_flags & kPpuRenderFlags_NewRenderer) != 0;
+  if (g_config.no_sprite_limits)
     g_ppu_render_flags |= kPpuRenderFlags_NoSpriteLimits;
   else
     g_ppu_render_flags &= ~kPpuRenderFlags_NoSpriteLimits;
-  PpuBeginDrawing(g_ppu, g_my_pixels, (size_t)width * 4, 0);
+  PpuBeginDrawing(g_ppu, g_my_pixels, 256 * 4, 0);
 }
 
-static void SmDisplay_StretchWidescreenLiquidBand(void) {
-  if (!g_ws_active || g_snes_width <= 256)
-    return;
-
-  uint16_t fx_type = (uint16_t)(g_ram[0x196E] | (g_ram[0x196F] << 8));
-  if (fx_type != 2 && fx_type != 4)
-    return;
-
-  int camera_y = g_ram[0x0915] | (g_ram[0x0916] << 8);
-  int fx_y = g_ram[0x1962] | (g_ram[0x1963] << 8);
-  int y0 = fx_y - camera_y;
-  if (y0 < 32) y0 = 32;
-  if (y0 >= g_snes_height)
-    return;
-
-  uint32_t native_line[kPpuXPixels];
-  for (int y = y0; y < g_snes_height; y++) {
-    uint32_t *row = (uint32_t *)(g_my_pixels + (size_t)y * g_snes_width * 4);
-    memcpy(native_line, row + g_ws_extra, sizeof(native_line));
-    for (int x = 0; x < g_snes_width; x++) {
-      int sx = (x * kPpuXPixels) / g_snes_width;
-      if (sx >= kPpuXPixels) sx = kPpuXPixels - 1;
-      row[x] = native_line[sx];
-    }
-  }
-}
-
-bool SmDisplay_IsWidescreenActive(void) { return g_ws_active; }
+bool SmDisplay_IsWidescreenActive(void) { return g_sm_viewport.enhanced; }
 int SmDisplay_GetCurrentFrameWidth(void) {
   return g_snes_width > 0 ? g_snes_width : 256;
 }
@@ -373,18 +400,9 @@ static void LoadScript(const char *path) {
       e->poke_count = 0;
       pending_wait = 0;
     } else if (strcmp(cmd, "spawnpb") == 0) {
-      if (g_script_count >= cap) {
-        cap *= 2;
-        g_script_entries = (ScriptEntry *)realloc(g_script_entries, cap * sizeof(ScriptEntry));
-      }
-      ScriptEntry *e = &g_script_entries[g_script_count++];
-      e->mask = 0x10000000;  // special flag: spawn power bomb HDMA objects
-      e->hold_frames = 1;
-      e->wait_frames = pending_wait;
-      e->poke_addr = 0;
-      e->poke_bytes = NULL;
-      e->poke_count = 0;
-      pending_wait = 0;
+      fprintf(stderr, "script: spawnpb cannot safely call guest code outside the game fiber; use the input-driven powerbomb_debug fixture\n");
+      fclose(f);
+      exit(2);
     } else if (strcmp(cmd, "forcepoke") == 0) {
       unsigned addr = 0;
       char hex[256] = {0};
@@ -494,11 +512,6 @@ static uint32 TickScript(void) {
           AddScriptForcePoke(e->poke_addr, e->poke_bytes, e->poke_count);
         return 0;
       }
-      if (e->mask & 0x10000000) {
-        EnableHdmaObjects(&g_cpu);
-        SpawnPowerBombExplosion(&g_cpu);
-        return 0;
-      }
       return e->mask;
     }
     // hold done — advance
@@ -602,86 +615,34 @@ static SDL_HitTestResult HitTestCallback(SDL_Window *win, const SDL_Point *pt, v
   return SDL_HITTEST_NORMAL;
 }
 
-void RtlDrawPpuFrame(uint8 *pixel_buffer, size_t pitch, uint32 render_flags) {
-  if (g_ws_active) {
-    /* The PPU only overwrites the side columns enabled for the current room.
-     * Clear the full 16:9 surface first so room-edge padding, reset frames,
-     * and transitions can never expose pixels retained from an older frame. */
-    memset(g_my_pixels, 0,
-           (size_t)g_snes_width * 4 * (size_t)g_snes_height);
-
-    uint16_t state = (uint16_t)(g_ram[0x0998] | (g_ram[0x0999] << 8));
-    bool room_view =
-        (state >= 7 && state <= 13) ||   // gameplay + door/loading path
-        (state >= 16 && state <= 25) ||  // unpause + death sequence
-        state == 27 ||                   // reserve-tank auto refill
-        (state >= 32 && state <= 38) ||  // Ceres/Zebes gameplay sequences
-        state == 42;                     // attract-mode gameplay
-
-    /* Set the fixed centering budget first, then expose only columns that
-     * physically exist inside the current room. This prevents tilemap wrap or
-     * stale VRAM at the left/right boundary of one-screen rooms. */
-    PpuSetExtraSpaceCentered(g_ppu, (uint8_t)g_ws_extra);
-    if (room_view) {
-      int camera_x = g_ram[0x0911] | (g_ram[0x0912] << 8);
-      int camera_y = g_ram[0x0915] | (g_ram[0x0916] << 8);
-      int layer2_x = g_ram[0x0917] | (g_ram[0x0918] << 8);
-      int layer2_y = g_ram[0x0919] | (g_ram[0x091A] << 8);
-      int left, right;
-      SmWidescreenGetSideSpace(camera_x, camera_y, g_ws_extra,
-                               &left, &right);
-      PpuSetExtraSideSpace(g_ppu, left, right, 0);
-
-      /* BG1 is streamed only for the native viewport. Register its world
-       * origin, capture the authentic center, then prefill the new columns
-       * from the decompressed room blockmap. Unknown tiles are transparent,
-       * never stale VRAM. Rain is rendered on BG3 below the 32-line HUD, so
-       * widen that part of BG3 directly. Do not repeat BG2: the landing-site
-       * ship lives there and cyclic repetition makes it wrap to the opposite
-       * side of the viewport. */
-      WsShadowSetWorld(0, (uint32_t)camera_x, (uint32_t)camera_y);
-      WsShadowSetBlankTile(0, 0);
-      bool landing_site =
-          (g_ram[0x079B] | (g_ram[0x079C] << 8)) == 0x91F8;
-      if (landing_site) {
-        WsShadowSetWorld(1, (uint32_t)layer2_x, (uint32_t)layer2_y);
-        WsShadowSetBlankTile(1, 0x0338);
-      }
-      WsShadowFrame(g_ppu);
-      SmWidescreenPrefillRoomMargins(camera_x, camera_y, layer2_x, layer2_y,
-                                     left, right);
-      /* BG3 is a room-specific effect layer, not a general world layer.
-       * Landing Site rain has valid map data, so let it render naturally.
-       * Other rooms get a below-HUD stretch band: lava/water/effect layers
-       * fill 16:9, but stale offscreen BG3 tilemap cells never leak in.
-       * Lava/acid get a final composed liquid-band stretch after PPU render so
-       * BG2/BG3/color math stay locked together with no 4:3 seam. */
-      if (landing_site) {
-        PpuSetWidescreenBg3Widen(g_ppu, 32);
-      } else {
-        PpuSetWidescreenBg3Widen(g_ppu, 0);
-        uint16_t fx_type = (uint16_t)(g_ram[0x196E] | (g_ram[0x196F] << 8));
-        if (fx_type != 2 && fx_type != 4)
-          PpuSetWidescreenLayerStretchBand(g_ppu, 2, 32, 224);
-      }
-
-      /* HUD columns: 0..9 energy/reserve, 10..25 weapon selector, 26..31
-       * minimap. Anchor the outer groups to their respective 16:9 edges and
-       * retain the weapon selector at the original screen center. */
-      PpuSetWidescreenHudSplit(
-          g_ppu, g_config.widescreen_hud ? 32 : 0, 80, 208);
-      PpuSetWsHudOamShiftRange(g_ppu, 16, g_config.widescreen_hud ? 67 : 0);
-    } else {
-      WsShadowFrame(g_ppu);
-      PpuSetWidescreenBg3Widen(g_ppu, 0);
-      PpuSetWidescreenHudSplit(g_ppu, 0, 80, 208);
-      PpuSetWsHudOamShiftRange(g_ppu, 0, 0);
-    }
-  }
+/* Simulation owns this call: HDMA and raster IRQ execute exactly once even
+ * when a simulation frame is not presented, and never for interpolated output. */
+static void SmCaptureSimulationFrame(unsigned number) {
+  SmDisplay_PreparePpuFrame();
+  if (SmCustomRendererEnabled()) SmRendererBeginFrame(g_ram, number);
   g_rtl_game_info->draw_ppu_frame();
-  SmDisplay_StretchWidescreenLiquidBand();
-  RtlWidescreenPresent(pixel_buffer, pitch, g_my_pixels,
-                       g_snes_width, g_snes_height);
+  if (SmCustomRendererEnabled())
+    SmRendererEndFrame((const uint32_t *)g_my_pixels);
+  const char *capture_frame = getenv("SM_CAPTURE_FRAME");
+  const char *capture_path = getenv("SM_CAPTURE_PATH");
+  if (capture_frame && capture_path && number == strtoul(capture_frame, NULL, 10))
+    SmRendererSaveCapture(capture_path);
+}
+
+void RtlDrawPpuFrame(uint8 *pixel_buffer, size_t pitch, uint32 render_flags) {
+  (void)render_flags;
+  if (!pixel_buffer) return;
+  const uint8_t *source = g_my_pixels;
+  if (SmCustomRendererEnabled()) {
+    if (!SmRendererDraw(g_sm_output, g_sm_viewport, g_sm_video.hud_anchored, g_sm_alpha)) {
+      memset(g_sm_output, 0, sizeof(g_sm_output));
+      for (int y = 0; y < SM_HEIGHT; ++y)
+        memcpy(g_sm_output + y * g_snes_width + g_sm_viewport.extra,
+               g_my_pixels + y * 256 * 4, 256 * 4);
+    }
+    source = (const uint8_t *)g_sm_output;
+  }
+  RtlWidescreenPresent(pixel_buffer, pitch, source, g_snes_width, g_snes_height);
 }
 
 #ifdef ENABLE_ORACLE_BACKEND
@@ -707,6 +668,7 @@ static uint16_t mmx_runner_to_snes_joypad(uint16_t r) {
 #endif
 
 static void DrawPpuFrameWithPerf(void) {
+  double profile_start = SmProfileStart();
   SmDisplay_PreparePpuFrame();
   const int render_scale = 1;
   uint8 *pixel_buffer = 0;
@@ -715,6 +677,8 @@ static void DrawPpuFrameWithPerf(void) {
   g_renderer_funcs.BeginDraw(g_snes_width * render_scale,
                              g_snes_height * render_scale,
                              &pixel_buffer, &pitch);
+  SmProfileEnd(kSmProfileAcquire, profile_start);
+  profile_start = SmProfileStart();
   if (g_display_perf || g_config.display_perf_title) {
     static float history[64], average;
     static int history_pos;
@@ -732,7 +696,10 @@ static void DrawPpuFrameWithPerf(void) {
   if (g_display_perf)
     RenderNumber(pixel_buffer + pitch * render_scale, pitch, g_curr_fps, render_scale == 4);
 
+  SmProfileEnd(kSmProfileCompose, profile_start);
+  profile_start = SmProfileStart();
   g_renderer_funcs.EndDraw();
+  SmProfileEnd(kSmProfilePresent, profile_start);
 }
 
 static SDL_mutex *g_audio_mutex;
@@ -844,7 +811,7 @@ static bool SdlRenderer_Init(SDL_Window *window) {
    * SDL_RendererInfo entirely. snesrecomp_sdl_create_renderer() hides both. */
   bool want_software = g_config.output_method == kOutputMethod_SDLSoftware;
   SDL_Renderer *renderer = snesrecomp_sdl_create_renderer(
-      g_window, want_software, /*vsync=*/true);
+      g_window, want_software, /*vsync=*/!g_sm_video.fps_enabled && !g_config.disable_frame_delay);
   if (renderer == NULL) {
     printf("Failed to create renderer: %s\n", SDL_GetError());
     return false;
@@ -1108,6 +1075,9 @@ int main(int argc, char** argv) {
   }
   ParseConfigFile(config_file);
   g_active_config_file = config_file;
+  if (!SmVideoLoad(&g_sm_video, kSmVideoConfig))
+    fprintf(stderr, "[video] Invalid settings in %s; valid entries retained.\n", kSmVideoConfig);
+  SmRendererReset();
   // Apply local overrides if present (gitignored). Lets a developer
   // mute audio etc. without touching the checked-in mmx.ini. Last
   // parser to set a key wins, so local overrides take precedence.
@@ -1236,6 +1206,9 @@ int main(int argc, char** argv) {
         gi.known_sha256 = &kSuperMetroidSha256;   /* single accepted digest */
         gi.num_known_sha256 = 1;
         gi.widescreen_supported = 0;
+#if defined(RECOMP_LAUNCHER)
+        gi.mods = SmModsProvider(&g_sm_video, kSmVideoConfig);
+#endif
         gi.msu1_supported = 0;         /* hide MSU-1 panel */
         gi.config_path = config_file;  /* hotkey editor targets the live config */
 
@@ -1340,23 +1313,25 @@ int main(int argc, char** argv) {
   }
 
   g_gamepad[0].joystick_id = g_gamepad[1].joystick_id = -1;
-  /* Hidden opt-in for automated A/B and smoke runs. */
+  /* Compatibility with existing capture commands now selects the custom
+   * renderer, never the old guest activation/culling overrides. */
   {
     const char *ws_env = getenv("SNESRECOMP_WIDESCREEN");
-    if (ws_env && *ws_env)
-      g_config.widescreen = atoi(ws_env) != 0;
+    if (ws_env && *ws_env) g_sm_video.enhanced = atoi(ws_env) != 0;
+    const char *aspect = getenv("SM_VIDEO_ASPECT");
+    if (aspect && !SmParseAspect(aspect, &g_sm_video.aspect))
+      fprintf(stderr, "[video] Ignoring invalid SM_VIDEO_ASPECT\n");
   }
-  g_snes_width = g_config.widescreen
-      ? SmDisplay_ComputeFrameWidth(16, 9, true) : 256;
-  g_ws_extra = (g_snes_width - 256) / 2;
-  g_ws_active = g_ws_extra != 0;
-  g_snes_height = 224;
+  g_sm_viewport = SmCalculateViewport(&g_sm_video, 16, 9);
+  g_snes_width = g_sm_viewport.width;
+  g_ws_extra = 0;
+  g_ws_active = false;
+  g_snes_height = SM_HEIGHT;
   g_ppu_render_flags = g_config.new_renderer * kPpuRenderFlags_NewRenderer |
-    (g_config.no_sprite_limits || g_ws_active) *
-      kPpuRenderFlags_NoSpriteLimits;
-  host_report_breadcrumb("widescreen: %s extra=%d hud=%d",
-                         g_ws_active ? "on" : "off", g_ws_extra,
-                         g_config.widescreen_hud);
+    g_config.no_sprite_limits * kPpuRenderFlags_NoSpriteLimits;
+  host_report_breadcrumb("custom renderer: %d aspect=%s fps=%u hud=%d",
+                         SmCustomRendererEnabled(), SmAspectName(g_sm_video.aspect),
+                         g_sm_video.fps, g_sm_video.hud_anchored);
 
   if (g_config.fullscreen == 1)
     g_win_flags ^= SNESRECOMP_SDL_WINDOW_FULLSCREEN_DESKTOP;
@@ -1427,6 +1402,7 @@ int main(int argc, char** argv) {
       goto error_reading;
   }
   host_report_breadcrumb("rom loaded: %u bytes", kRom_SIZE);
+  SmRendererSetRom(kRom, kRom_SIZE);
 
   extern const RtlGameInfo kSuperMetroidGameInfo;
   RtlRegisterGame(&kSuperMetroidGameInfo);
@@ -1647,8 +1623,24 @@ error_reading:;
   uint32 lastTick = SDL_GetTicks();
   uint32 curTick = 0;
   uint32 frameCtr = 0;
+  const char *run_frames_env = getenv("SM_RUN_FRAMES");
+  unsigned run_frames = run_frames_env ? (unsigned)strtoul(run_frames_env, NULL, 10) : 0;
+  const char *trace_path = getenv("SM_STATE_TRACE");
+  FILE *state_trace = trace_path ? fopen(trace_path, "w") : NULL;
+  uint64_t presentations = 0;
+  bool profile_requested = getenv("SM_PROFILE") && atoi(getenv("SM_PROFILE")) != 0;
+  unsigned profile_first = getenv("SM_PROFILE_START_FRAME")
+      ? (unsigned)strtoul(getenv("SM_PROFILE_START_FRAME"), NULL, 10) : 1;
+  if (!profile_first) profile_first = 1;
+  double profile_window_start = 0;
+  double run_start = SmMonotonicSeconds();
   uint8 audiopaused = true;
   GamepadInfo *gi;
+  SmClock video_clock;
+  double presentation_hz = g_sm_video.fps_enabled
+      ? SmPresentationHz(g_sm_video.fps, SmDisplayRefresh()) : SM_SIMULATION_HZ;
+  SmClockReset(&video_clock, SmMonotonicSeconds(), presentation_hz);
+  double next_display_check = 0;
 
   host_report_breadcrumb("entering main loop");
 
@@ -1721,6 +1713,7 @@ error_reading:;
     }
 
     if (g_paused) {
+      SmClockReset(&video_clock, SmMonotonicSeconds(), presentation_hz);
       SDL_Delay(16);
       continue;
     }
@@ -1732,13 +1725,50 @@ error_reading:;
       g_gamepad[1].axis_buttons = 0;
     {
       int ls = debug_server_consume_loadstate();
-      if (ls >= 0)
+      if (ls >= 0) {
         RtlSaveLoad(kSaveLoad_Load, ls);
+        SmRendererReset();
+        SmClockReset(&video_clock, SmMonotonicSeconds(), presentation_hz);
+      }
       int ss = debug_server_consume_savestate();
       if (ss >= 0)
         RtlSaveLoad(kSaveLoad_Save, ss);
     }
+    double before_debug_wait = SmMonotonicSeconds();
     debug_server_wait_if_paused();
+    if (SmMonotonicSeconds() - before_debug_wait > 0.05)
+      SmClockReset(&video_clock, SmMonotonicSeconds(), presentation_hz);
+
+    /* Presentation-only iterations do not tick scripted input, the oracle,
+     * audio/game frame counters, IRQ, or HDMA. Simulation debt is preserved. */
+    bool paced_custom = SmCustomRendererEnabled() && !g_turbo && !g_config.disable_frame_delay;
+    double video_now = SmMonotonicSeconds();
+    if (video_now >= next_display_check) {
+      double hz = g_sm_video.fps_enabled
+          ? SmPresentationHz(g_sm_video.fps, SmDisplayRefresh()) : SM_SIMULATION_HZ;
+      if (hz != presentation_hz) {
+        presentation_hz = video_clock.presentation_hz = hz;
+        video_clock.next_presentation = video_now;
+      }
+      next_display_check = video_now + 0.25;
+    }
+    if (g_sm_reset_clock) {
+      SmClockReset(&video_clock, video_now, presentation_hz);
+      g_sm_reset_clock = false;
+    }
+    if (paced_custom && !SmClockSimulationDue(&video_clock, SmMonotonicSeconds())) {
+      if (SmClockPresentationDue(&video_clock, SmMonotonicSeconds())) {
+        double presented_at = SmMonotonicSeconds();
+        g_sm_alpha = g_sm_video.fps_enabled ? SmClockAlpha(&video_clock, presented_at) : 1;
+        DrawPpuFrameWithPerf();
+        ++presentations;
+        /* Count deadlines at dispatch, not after the render/upload cost:
+         * crossing the next deadline while drawing does not consume it. */
+        SmClockPresentationDone(&video_clock, presented_at);
+      }
+      SmWaitUntil(SmClockNextDeadline(&video_clock));
+      continue;
+    }
 
     /* Drive the SNES controller bits in g_input_state from keybinds.ini.
      * mmx.ini's [KeyMap] still owns system commands (state save/load,
@@ -1764,8 +1794,16 @@ error_reading:;
     uint32 inputs = g_input_state | g_pad_buttons | g_gamepad[0].axis_buttons | g_gamepad[1].axis_buttons << 12;
     inputs |= TickScript();
     inputs |= debug_server_get_controller_inputs();
+    g_sm_profile_frame = frameCtr + 1;
+    if (profile_requested && !g_sm_profile && g_sm_profile_frame >= profile_first) {
+      g_sm_profile = true;
+      profile_window_start = SmMonotonicSeconds();
+    }
+    double profile_start = SmProfileStart();
+    if (SmCustomRendererEnabled()) SmRendererLatchObjectState(g_ram);
     RtlRunFrame(inputs | GetActiveControllers() | debug_server_get_controller_active_mask());
     ApplyScriptForcePokes();
+    SmProfileEnd(kSmProfileGuest, profile_start);
 
 #ifdef ENABLE_ORACLE_BACKEND
     // Step the oracle emulator with the same input. The runner's per-player
@@ -1795,17 +1833,36 @@ error_reading:;
       host_report_breadcrumb("heartbeat: frame=%u", frameCtr);
     g_snes->disableRender = g_turbo && (frameCtr & 0xf) != 0;
 
-    if (!g_snes->disableRender) {
+    profile_start = SmProfileStart();
+    SmCaptureSimulationFrame(frameCtr);
+    SmProfileEnd(kSmProfileRaster, profile_start);
+    profile_start = SmProfileStart();
+    if (state_trace)
+      fprintf(state_trace, "%u,%08x,%04x,%04x,%04x,%04x,%04x,%02x,%02x,%02x\n",
+              frameCtr, crc32_compute(g_ram, 0x20000), g_cpu.A, g_cpu.X, g_cpu.Y,
+              g_cpu.S, g_cpu.D, g_cpu.DB, g_cpu.PB, g_cpu.P);
+    SmProfileEnd(kSmProfileTrace, profile_start);
+    if (paced_custom)
+      SmClockSimulationDone(&video_clock);
+    else
+      SmClockReset(&video_clock, SmMonotonicSeconds(), presentation_hz);
+    if (!g_snes->disableRender &&
+        (!paced_custom || SmClockPresentationDue(&video_clock, SmMonotonicSeconds()) ||
+         (run_frames && frameCtr >= run_frames))) {
+      double presented_at = SmMonotonicSeconds();
+      g_sm_alpha = paced_custom && g_sm_video.fps_enabled
+          ? SmClockAlpha(&video_clock, presented_at) : 1;
       DrawPpuFrameWithPerf();
-    } else {
-      SmDisplay_PreparePpuFrame();
-      g_rtl_game_info->draw_ppu_frame();
+      ++presentations;
+      SmClockPresentationDone(&video_clock, presented_at);
     }
+    if (run_frames && frameCtr >= run_frames)
+      running = false;
 
     // if vsync isn't working, delay manually
     curTick = SDL_GetTicks();
 
-    if (!g_snes->disableRender && !g_config.disable_frame_delay) {
+    if (!paced_custom && !g_snes->disableRender && !g_config.disable_frame_delay) {
       static const uint8 delays[3] = { 17, 17, 16 }; // 60 fps
       lastTick += delays[frameCtr % 3];
 
@@ -1821,6 +1878,24 @@ error_reading:;
         lastTick = curTick;
       }
     }
+  }
+
+  if (state_trace) fclose(state_trace);
+  host_report_breadcrumb("video totals: simulations=%u presentations=%llu seconds=%.3f",
+                         frameCtr, (unsigned long long)presentations,
+                         SmMonotonicSeconds() - run_start);
+  if (g_sm_profile) {
+    double profile_seconds = SmMonotonicSeconds() - profile_window_start;
+    host_report_breadcrumb("video profile window: first=%u last=%u seconds=%.6f presentations=%u",
+        profile_first, frameCtr, profile_seconds, g_sm_timings[kSmProfilePresent].count);
+    static const char *names[kSmProfileCount] = {
+      "guest", "raster-capture", "surface-acquire", "compose", "upload-present", "state-trace"
+    };
+    for (unsigned i = 0; i < kSmProfileCount; ++i)
+      host_report_breadcrumb("video profile: stage=%s count=%u total_ms=%.3f mean_ms=%.3f max_ms=%.3f max_frame=%u",
+          names[i], g_sm_timings[i].count, g_sm_timings[i].total * 1000,
+          g_sm_timings[i].count ? g_sm_timings[i].total * 1000 / g_sm_timings[i].count : 0,
+          g_sm_timings[i].maximum * 1000, g_sm_timings[i].maximum_frame);
   }
 
   if (g_config.autosave)
@@ -1923,6 +1998,8 @@ static void HandleCommand(uint32 j, bool pressed) {
     return;
   if (j <= kKeys_Load_Last) {
     RtlSaveLoad(kSaveLoad_Load, j - kKeys_Load);
+    SmRendererReset();
+    g_sm_reset_clock = true;
   } else if (j <= kKeys_Save_Last) {
     RtlSaveLoad(kSaveLoad_Save, j - kKeys_Save);
   } else {
@@ -1935,6 +2012,8 @@ static void HandleCommand(uint32 j, bool pressed) {
       break;
     case kKeys_Reset:
       RtlReset(1);
+      SmRendererReset();
+      g_sm_reset_clock = true;
       break;
     case kKeys_Pause: g_paused = !g_paused; break;
     case kKeys_PauseDimmed:

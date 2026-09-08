@@ -1,4 +1,5 @@
 #include "sm_rtl.h"
+#include "sm_renderer.h"
 #include "variables.h"
 #include "common_cpu_infra.h"
 #include "snes/snes.h"
@@ -266,6 +267,25 @@ void RunOneFrameOfGame(void) {
 void SmDrawPpuFrame(void) {
   SimpleHdma hdma_chans[8];
   Dma *dma = g_dma;
+  /* Optional host-only trace of the DMA registers actually consumed by the
+   * raster pass. WRAM object table pointers may have changed since NMI. */
+  static bool trace_checked;
+  static FILE *dma_trace;
+  static unsigned trace_frame;
+  ++trace_frame;
+  if (!trace_checked) {
+    const char *path = getenv("SM_DMA_TRACE");
+    trace_checked = true;
+    if (path) dma_trace = fopen(path, "w");
+  }
+  if (dma_trace) {
+    for (unsigned ch = 0; ch < 8; ++ch) {
+      const DmaChannel *c = &dma->channel[ch];
+      fprintf(dma_trace, "%u,%u,%02x,%04x,%02x,%u,%u,%02x,%02x\n", trace_frame,
+          ch, c->aBank, c->aAdr, c->bAdr, c->mode, c->indirect, c->indBank,
+          g_snesrecomp_last_hdmaen);
+    }
+  }
 
   /* Reinitialize HDMA from the last $420C (HDMAEN) value written during
    * NMI. Super Metroid drives the HUD/status split and various color/
@@ -300,6 +320,8 @@ void SmDrawPpuFrame(void) {
       I_IRQ(&g_cpu);
       trigger = g_snes->vIrqEnabled ? g_snes->vTimer : -1;
     }
+    if (g_sm_video.enhanced || g_sm_video.fps_enabled)
+      SmRendererCaptureLine(g_ppu, i);
     ppu_runLine(g_ppu, i);
   }
 }

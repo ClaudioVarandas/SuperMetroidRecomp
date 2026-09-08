@@ -39,19 +39,6 @@ if(BUILD_TESTING AND NOT ANDROID)
         ${SNESRECOMP_ROOT}/runner/src)
     add_test(NAME ppu_widescreen_windows COMMAND ppu_window_test)
 
-    add_executable(sm_widescreen_test tests/sm_widescreen_test.c src/sm_widescreen.c)
-    target_include_directories(sm_widescreen_test PRIVATE
-        src
-        ${SNESRECOMP_ROOT}/runner/src)
-    add_test(NAME sm_widescreen_helpers COMMAND sm_widescreen_test)
-
-    add_test(NAME sm_widescreen_visual_smoke
-        COMMAND ${Python3_EXECUTABLE}
-                ${CMAKE_CURRENT_SOURCE_DIR}/tools/widescreen_visual_smoke.py
-                --root ${CMAKE_CURRENT_SOURCE_DIR}
-                --skip-missing)
-    set_tests_properties(sm_widescreen_visual_smoke PROPERTIES
-        SKIP_RETURN_CODE 77)
 endif()
 
 # Android uses the SDL2 source tree fetched by android/fetch_sdl.sh. Desktop
@@ -72,7 +59,42 @@ include(${SNESRECOMP_ROOT}/runner/runner.cmake)
 # somewhere other than the in-tree submodule.
 set(RECOMP_UI_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/recomp-ui" CACHE PATH
     "Path to the shared recomp-ui checkout used by this game")
+set(RECOMP_UI_ENABLE_MODS ON CACHE BOOL
+    "Enable Super Metroid built-in presentation Mods" FORCE)
 include(${RECOMP_UI_ROOT}/recomp_ui.cmake)
+
+if(BUILD_TESTING AND NOT ANDROID)
+    add_executable(sm_video_test
+        tests/sm_video_test.c src/sm_video.c src/sm_mods.c)
+    target_include_directories(sm_video_test PRIVATE src ${RECOMP_UI_ROOT}/src)
+    add_test(NAME sm_custom_video
+        COMMAND sm_video_test ${CMAKE_CURRENT_BINARY_DIR}/sm-video-test.ini)
+
+    add_executable(sm_renderer_test tests/sm_renderer_test.c src/sm_renderer.c src/sm_mode7.c)
+    target_include_directories(sm_renderer_test PRIVATE
+        src ${SNESRECOMP_ROOT}/runner/src)
+    add_test(NAME sm_custom_renderer
+        COMMAND sm_renderer_test ${CMAKE_CURRENT_BINARY_DIR}/sm-renderer-test.capture)
+    add_executable(sm_mode7_test tests/sm_mode7_test.c src/sm_mode7.c)
+    target_include_directories(sm_mode7_test PRIVATE src)
+    add_test(NAME sm_custom_mode7 COMMAND sm_mode7_test)
+    add_executable(sm_render_capture tools/sm_render_capture.c src/sm_renderer.c src/sm_video.c src/sm_mode7.c)
+    target_include_directories(sm_render_capture PRIVATE src ${SNESRECOMP_ROOT}/runner/src)
+    # Assertions are the test oracle, including Release configurations.
+    foreach(sm_test sm_video_test sm_renderer_test)
+        if(MSVC)
+            target_compile_options(${sm_test} PRIVATE /UNDEBUG)
+        else()
+            target_compile_options(${sm_test} PRIVATE -UNDEBUG)
+        endif()
+    endforeach()
+    if(NOT WIN32)
+        target_link_libraries(sm_video_test PRIVATE m)
+        target_link_libraries(sm_renderer_test PRIVATE m)
+        target_link_libraries(sm_render_capture PRIVATE m)
+        target_link_libraries(sm_mode7_test PRIVATE m)
+    endif()
+endif()
 
 # On Android the SDL2 target comes from the sibling add_subdirectory(SDL) in
 # android/app/jni/CMakeLists.txt, and rendering goes through SDL_Renderer on
@@ -95,18 +117,6 @@ if(NOT SM_GEN_SOURCES)
         "Super Metroid ROM at the repo root before building.")
 endif()
 
-# Generated sources are regenerated from the ROM and remain untracked. Apply
-# the opt-in, runtime-gated enemy range branches before any bank is compiled so
-# regen cannot silently discard widescreen spawning/effect culling support.
-add_custom_target(sm_widescreen_overrides ALL
-    COMMAND ${Python3_EXECUTABLE}
-            ${CMAKE_CURRENT_SOURCE_DIR}/tools/apply_widescreen_overrides.py
-            --check --gen-dir ${SM_GEN_DIR}
-    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
-    COMMENT "Applying Super Metroid widescreen enemy range overrides"
-    VERBATIM
-)
-
 set(SM_HOST_SOURCES
     ${SNESRECOMP_RUNNER_SOURCES}
     # game-specific runtime
@@ -118,7 +128,10 @@ set(SM_HOST_SOURCES
     src/sm_cpu_infra.c
     src/sm_rtl.c
     src/sm_spc_player.c
-    src/sm_widescreen.c
+    src/sm_renderer.c
+    src/sm_mode7.c
+    src/sm_video.c
+    src/sm_mods.c
     src/fiber_compat.c    # Win32 Fiber API shim (ucontext/pthread) for non-Windows
     # recompiled banks (generated)
     ${SM_GEN_SOURCES}
@@ -139,7 +152,6 @@ else()
     add_executable(SuperMetroidSNESRecomp ${SM_HOST_SOURCES})
 endif()
 
-add_dependencies(SuperMetroidSNESRecomp sm_widescreen_overrides)
 
 target_include_directories(SuperMetroidSNESRecomp PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}

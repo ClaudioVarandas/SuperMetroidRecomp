@@ -57,7 +57,7 @@ Game-side ctest targets: `sm_display_geometry`, `ppu_widescreen_windows`, `sm_wi
 
 ### Generation pipeline
 
-`recomp/bankXX.cfg` files carry per-bank directives: `func <Name> <pc> end:<next>` boundaries (harvested from the snesrev/sm decomp — the symbol/behavior ground truth), `hle_func` (route a PC to a hand-written C body), and `indirect_dispatch` (authorize `JSR (abs,X)`-style indirect calls with enumerated targets; dispatch target tables come from `recomp/sm_decomp_symbols.json`). `tools/regen.sh` drives `snesrecomp/tools/v2_emit.py` with the runtime profile `profiles/attract_tier2.json` (selects observed AOT work), applies widescreen overrides, and syncs `recomp/funcs.h`. Unauthorized indirect calls with WRAM pointer bases become runtime dispatches through `cpu_dispatch_*` in the runner.
+`recomp/bankXX.cfg` files carry per-bank directives: `func <Name> <pc> end:<next>` boundaries (harvested from the snesrev/sm decomp — the symbol/behavior ground truth), `hle_func` (route a PC to a hand-written C body), and `indirect_dispatch` (authorize `JSR (abs,X)`-style indirect calls with enumerated targets; dispatch target tables come from `recomp/sm_decomp_symbols.json`). `tools/regen.sh` drives `snesrecomp/tools/v2_emit.py` with the runtime profile `profiles/attract_tier2.json` (selects observed AOT work) and syncs `recomp/funcs.h`. This worktree no longer applies guest widescreen overrides. Unauthorized indirect calls with WRAM pointer bases become runtime dispatches through `cpu_dispatch_*` in the runner.
 
 ### Single-fiber frame model (src/sm_rtl.c)
 
@@ -67,7 +67,11 @@ Other game-side runtime: `sm_cpu_infra.c` (game registration consumed by the run
 
 ### Widescreen
 
-Opt-in and runtime-gated (`g_ws_active`); when off, original branches evaluate unchanged. `tools/apply_widescreen_overrides.py` injects idempotent, marker-tagged edits into generated C at stable ROM basic-block labels — the sanctioned exception to "never touch src/gen by hand," done by tool so regen can't silently drop it (a CMake custom target runs it with `--check` before every build). `recomp/widescreen_aot_roots.c` forces the required enemy/e-projectile hook families to be materialized at regen; `src/sm_widescreen.c` holds the host-side helpers.
+This worktree replaces the old generated guest widescreen overrides with a
+read-only custom renderer. Do not reintroduce the deleted override script or
+AOT roots. The guest stays at 256 pixels and `g_ws_active` remains false.
+See `docs/custom-renderer.md` for current implementation status and validation
+gaps. Full regeneration remains mandatory after changing generation inputs.
 
 ### Debugging workflow
 

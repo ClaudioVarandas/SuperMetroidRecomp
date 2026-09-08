@@ -55,22 +55,13 @@ if [ "$ANALYSIS_BACKEND" = native ]; then
 fi
 
 step "Regenerating banks"
-# Super Metroid intentionally remains profile-scoped rather than using
-# --cfg-roots: expanding every declared function also expands the generated
-# camera-X surface, which must be audited by apply_widescreen_overrides.py
-# before those routines can safely run statically in widescreen. The runtime
-# profile selects reviewed AOT work, while the generator-only widescreen root
-# file materializes the exact enemy/e-projectile hook families required by the
-# checked-in postprocessor. Missing or rejected work still executes LLE.
+# Profile-scoped AOT only; presentation never changes guest culling or AI.
 "$PYTHON" "$SNESRECOMP_ROOT/tools/v2_emit.py" --rom "$ROM" \
     --cfg-dir recomp --out-dir src/gen \
     --source-root src \
-    --source-root recomp/widescreen_aot_roots.c \
     --profile-manifest "$PROFILE" \
     --analysis-backend "$ANALYSIS_BACKEND"
 
-step "Applying widescreen overrides"
-"$PYTHON" tools/apply_widescreen_overrides.py --gen-dir src/gen
 
 step "Syncing funcs.h"
 "$PYTHON" "$SNESRECOMP_ROOT/tools/v2_sync_funcs_h.py" --cfg-dir recomp \
@@ -82,10 +73,8 @@ if [ "$STRICT_IDEMPOTENT" -eq 1 ]; then
   "$PYTHON" "$SNESRECOMP_ROOT/tools/v2_emit.py" --rom "$ROM" \
       --cfg-dir recomp --out-dir "$TMP_GEN" \
       --source-root src \
-      --source-root recomp/widescreen_aot_roots.c \
       --profile-manifest "$PROFILE" \
       --analysis-backend "$ANALYSIS_BACKEND"
-  "$PYTHON" tools/apply_widescreen_overrides.py --gen-dir "$TMP_GEN"
   "$PYTHON" "$SNESRECOMP_ROOT/tools/v2_compare_output.py" \
       --expected src/gen --actual "$TMP_GEN"
   rm -rf "$TMP_GEN"
