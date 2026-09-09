@@ -112,3 +112,11 @@ cmake --build build -j 8
 <p align="center">
   <a href="https://discord.gg/Ad9BwSzctP"><img src=".github/raid-discord.png" alt="Join the Retro AI Development (R.A.I.D.) Discord" width="200"></a>
 </p>
+
+## License
+
+PolyForm Noncommercial 1.0.0. See `LICENSE`. Code in this repo is original;
+vendored dependencies under `third_party/` retain their own licenses.
+
+The game ROM and any data extracted from it are **not** in this repo and are
+not licensed for redistribution.
