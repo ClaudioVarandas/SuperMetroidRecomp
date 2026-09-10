@@ -45,16 +45,17 @@ int SmHudAnchorX(SmViewport viewport, int x, int anchor);
 bool SmVideoLoad(SmVideoSettings *settings, const char *path);
 bool SmVideoSave(const SmVideoSettings *settings, const char *path);
 
-/* Monotonic time in seconds. Simulation debt is never discarded here.
- * Hosts explicitly reset on pause/minimize/load, and bound catch-up batches
- * to keep pumping events when a machine cannot sustain the original rate. */
+/* Monotonic time in seconds. Realtime play does not repay wall-time debt:
+ * after a slow guest frame the next simulation deadline is scheduled from
+ * the current time. This keeps expensive room and door loading from turning
+ * into a burst of fast gameplay and audio. */
 typedef struct SmClock {
   double next_simulation, next_presentation, presentation_hz;
   uint64_t simulation_frames, presentations, missed_presentations;
 } SmClock;
 void SmClockReset(SmClock *clock, double now, double presentation_hz);
 bool SmClockSimulationDue(const SmClock *clock, double now);
-void SmClockSimulationDone(SmClock *clock);
+void SmClockSimulationDone(SmClock *clock, double now);
 bool SmClockPresentationDue(const SmClock *clock, double now);
 void SmClockPresentationDone(SmClock *clock, double now);
 double SmClockAlpha(const SmClock *clock, double now);

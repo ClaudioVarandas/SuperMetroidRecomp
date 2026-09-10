@@ -1620,8 +1620,6 @@ error_reading:;
     FrameDump_Init(framedump_dir);
 
   bool running = true;
-  uint32 lastTick = SDL_GetTicks();
-  uint32 curTick = 0;
   uint32 frameCtr = 0;
   const char *run_frames_env = getenv("SM_RUN_FRAMES");
   unsigned run_frames = run_frames_env ? (unsigned)strtoul(run_frames_env, NULL, 10) : 0;
@@ -1739,9 +1737,13 @@ error_reading:;
     if (SmMonotonicSeconds() - before_debug_wait > 0.05)
       SmClockReset(&video_clock, SmMonotonicSeconds(), presentation_hz);
 
-    /* Presentation-only iterations do not tick scripted input, the oracle,
-     * audio/game frame counters, IRQ, or HDMA. Simulation debt is preserved. */
-    bool paced_custom = SmCustomRendererEnabled() && !g_turbo && !g_config.disable_frame_delay;
+    /* Door loading can take longer than a frame. Realtime play must not repay
+     * that wall-time debt by simulating several guest frames back-to-back:
+     * doing so visibly speeds up Samus and advances the SPC audio at the same
+     * accelerated rate. Presentation-only iterations remain custom-renderer
+     * only, because they reuse a captured simulation frame. */
+    bool paced_realtime = !g_turbo && !g_config.disable_frame_delay;
+    bool paced_custom = SmCustomRendererEnabled() && paced_realtime;
     double video_now = SmMonotonicSeconds();
     if (video_now >= next_display_check) {
       double hz = g_sm_video.fps_enabled
@@ -1756,17 +1758,20 @@ error_reading:;
       SmClockReset(&video_clock, video_now, presentation_hz);
       g_sm_reset_clock = false;
     }
-    if (paced_custom && !SmClockSimulationDue(&video_clock, SmMonotonicSeconds())) {
+    if (paced_realtime && !SmClockSimulationDue(&video_clock, SmMonotonicSeconds())) {
       if (SmClockPresentationDue(&video_clock, SmMonotonicSeconds())) {
-        double presented_at = SmMonotonicSeconds();
-        g_sm_alpha = g_sm_video.fps_enabled ? SmClockAlpha(&video_clock, presented_at) : 1;
-        DrawPpuFrameWithPerf();
-        ++presentations;
-        /* Count deadlines at dispatch, not after the render/upload cost:
-         * crossing the next deadline while drawing does not consume it. */
-        SmClockPresentationDone(&video_clock, presented_at);
+        if (paced_custom) {
+          double presented_at = SmMonotonicSeconds();
+          g_sm_alpha = g_sm_video.fps_enabled ? SmClockAlpha(&video_clock, presented_at) : 1;
+          DrawPpuFrameWithPerf();
+          ++presentations;
+          /* Count deadlines at dispatch, not after the render/upload cost:
+           * crossing the next deadline while drawing does not consume it. */
+          SmClockPresentationDone(&video_clock, presented_at);
+        }
       }
-      SmWaitUntil(SmClockNextDeadline(&video_clock));
+      SmWaitUntil(paced_custom ? SmClockNextDeadline(&video_clock)
+                               : video_clock.next_simulation);
       continue;
     }
 
@@ -1842,8 +1847,8 @@ error_reading:;
               frameCtr, crc32_compute(g_ram, 0x20000), g_cpu.A, g_cpu.X, g_cpu.Y,
               g_cpu.S, g_cpu.D, g_cpu.DB, g_cpu.PB, g_cpu.P);
     SmProfileEnd(kSmProfileTrace, profile_start);
-    if (paced_custom)
-      SmClockSimulationDone(&video_clock);
+    if (paced_realtime)
+      SmClockSimulationDone(&video_clock, SmMonotonicSeconds());
     else
       SmClockReset(&video_clock, SmMonotonicSeconds(), presentation_hz);
     if (!g_snes->disableRender &&
@@ -1859,25 +1864,6 @@ error_reading:;
     if (run_frames && frameCtr >= run_frames)
       running = false;
 
-    // if vsync isn't working, delay manually
-    curTick = SDL_GetTicks();
-
-    if (!paced_custom && !g_snes->disableRender && !g_config.disable_frame_delay) {
-      static const uint8 delays[3] = { 17, 17, 16 }; // 60 fps
-      lastTick += delays[frameCtr % 3];
-
-      if (lastTick > curTick) {
-        uint32 delta = lastTick - curTick;
-        if (delta > 500) {
-          lastTick = curTick - 500;
-          delta = 500;
-        }
-        //        printf("Sleeping %d\n", delta);
-        SDL_Delay(delta);
-      } else if (curTick - lastTick > 500) {
-        lastTick = curTick;
-      }
-    }
   }
 
   if (state_trace) fclose(state_trace);
