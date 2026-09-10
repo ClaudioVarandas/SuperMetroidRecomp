@@ -133,8 +133,12 @@ void SmClockReset(SmClock *c, double now, double hz) {
 bool SmClockSimulationDue(const SmClock *c, double now) {
   return now >= c->next_simulation;
 }
-void SmClockSimulationDone(SmClock *c) {
-  c->next_simulation += 1.0 / SM_SIMULATION_HZ;
+void SmClockSimulationDone(SmClock *c, double now) {
+  double deadline = c->next_simulation + 1.0 / SM_SIMULATION_HZ;
+  /* Keep ordinary sub-frame scheduling jitter on the original phase. If the
+   * completed frame spans more than one deadline, drop the older debt rather
+   * than making the game visibly catch up after room loading. */
+  c->next_simulation = now > deadline ? now + 1.0 / SM_SIMULATION_HZ : deadline;
   ++c->simulation_frames;
 }
 bool SmClockPresentationDue(const SmClock *c, double now) {

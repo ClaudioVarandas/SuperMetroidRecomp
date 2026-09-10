@@ -39,7 +39,7 @@ static void clock_invariance(void) {
     SmClockReset(&clock,0,rates[r]);
     for (int ms=0;ms<=10000;++ms) {
       double now=ms/1000.0;
-      while (SmClockSimulationDue(&clock,now)) SmClockSimulationDone(&clock);
+      while (SmClockSimulationDue(&clock,now)) SmClockSimulationDone(&clock,now);
       if (SmClockPresentationDue(&clock,now)) SmClockPresentationDone(&clock,now);
       double alpha=SmClockAlpha(&clock,now);
       assert(alpha >= 0 && alpha <= 1);
@@ -51,8 +51,8 @@ static void clock_invariance(void) {
   SmClockReset(&stalled,0,144);
   SmClockPresentationDone(&stalled,5);
   assert(stalled.simulation_frames == 0 && SmClockSimulationDue(&stalled,5));
-  while(SmClockSimulationDue(&stalled,5)) SmClockSimulationDone(&stalled);
-  assert(stalled.simulation_frames == 301); /* Presentation must never discard guest debt. */
+  while(SmClockSimulationDue(&stalled,5)) SmClockSimulationDone(&stalled,5);
+  assert(stalled.simulation_frames == 1); /* Realtime play must discard stalled wall-time debt. */
   assert(SmPresentationHz(0,165) == 165);
   assert(SmPresentationHz(0,1000) == 360);
   assert(SmPresentationHz(0,NAN) == 60);
