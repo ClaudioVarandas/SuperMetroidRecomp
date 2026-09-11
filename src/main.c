@@ -30,6 +30,8 @@
 #endif
 
 #include "snes/ppu.h"
+#include "snes/apu.h"
+#include "audio_trace.h"
 #include "snes/ws_shadow.h"
 
 #include "types.h"
@@ -1498,6 +1500,7 @@ error_reading:;
   g_spc_player->initialize(g_spc_player);
   host_report_breadcrumb("SPC player initialized");
 
+  int audio_output_rate = 0;
   if (g_config.enable_audio) {
     /* Enumerate output devices into the breadcrumb ring: which device
      * SDL picks (and what else was available) is exactly the per-machine
@@ -1552,6 +1555,7 @@ error_reading:;
     /* The consumer converts the SPC's native 32040 Hz onto this rate and
      * cannot infer it; see RtlSetAudioOutputRate in common_rtl.h. */
     RtlSetAudioOutputRate(have.freq);
+    audio_output_rate = have.freq;
     g_frames_per_block = (534 * have.freq + 32040 / 2) / 32040;
     g_audiobuffer = (uint8 *)calloc(g_frames_per_block * have.channels * sizeof(int16), 1);
     host_report_breadcrumb(
@@ -1625,6 +1629,12 @@ error_reading:;
   unsigned run_frames = run_frames_env ? (unsigned)strtoul(run_frames_env, NULL, 10) : 0;
   const char *trace_path = getenv("SM_STATE_TRACE");
   FILE *state_trace = trace_path ? fopen(trace_path, "w") : NULL;
+  /* Optional production-path measurement. Sample after guest execution so a
+   * trace proves that the saved doorway was crossed, and attributes missing
+   * PCM to the transition rather than boot or loading the save itself. */
+  const char *audio_probe_path = getenv("SM_AUDIO_PROBE");
+  FILE *audio_probe = audio_probe_path ? fopen(audio_probe_path, "w") : NULL;
+  if (audio_probe) fprintf(audio_probe, "frame,seconds,guest_ms,state,door_step,room,master,port_clock,guest_anchor,target_anchor,last_guest,last_target,produced,consumed,underflows,occupancy,missing_frames,dropped,output_rate\n");
   uint64_t presentations = 0;
   bool profile_requested = getenv("SM_PROFILE") && atoi(getenv("SM_PROFILE")) != 0;
   unsigned profile_first = getenv("SM_PROFILE_START_FRAME")
@@ -1806,10 +1816,28 @@ error_reading:;
       profile_window_start = SmMonotonicSeconds();
     }
     double profile_start = SmProfileStart();
+    double audio_probe_start = audio_probe ? SmMonotonicSeconds() : 0;
     if (SmCustomRendererEnabled()) SmRendererLatchObjectState(g_ram);
     RtlRunFrame(inputs | GetActiveControllers() | debug_server_get_controller_active_mask());
     ApplyScriptForcePokes();
     SmProfileEnd(kSmProfileGuest, profile_start);
+    if (audio_probe) {
+      double now = SmMonotonicSeconds();
+      AudioTraceStats st;
+      audio_trace_get_stats(&st);
+      Apu *apu = g_snes->apu;
+      fprintf(audio_probe, "%d,%.6f,%.3f,%u,%04x,%04x,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%u,%llu,%llu,%d\n",
+          snes_frame_counter, now-run_start, (now-audio_probe_start)*1000,
+          g_ram[0x998] | g_ram[0x999]<<8, g_ram[0x99c] | g_ram[0x99d]<<8,
+          g_ram[0x79b] | g_ram[0x79c]<<8,
+          (unsigned long long)g_cpu.master_cycles,
+          (unsigned long long)apu->portClock, (unsigned long long)apu->portGuestAnchor,
+          (unsigned long long)apu->portTargetAnchor, (unsigned long long)apu->portLastGuest,
+          (unsigned long long)apu->portLastTarget, (unsigned long long)st.produced,
+          (unsigned long long)st.consumed, (unsigned long long)st.output_underflows, st.occupancy_current,
+          (unsigned long long)st.output_missing_frames,
+          (unsigned long long)st.dropped, audio_output_rate);
+    }
 
 #ifdef ENABLE_ORACLE_BACKEND
     // Step the oracle emulator with the same input. The runner's per-player
@@ -1871,6 +1899,7 @@ error_reading:;
   }
 
   if (state_trace) fclose(state_trace);
+  if (audio_probe) fclose(audio_probe);
   host_report_breadcrumb("video totals: simulations=%u presentations=%llu seconds=%.3f",
                          frameCtr, (unsigned long long)presentations,
                          SmMonotonicSeconds() - run_start);
