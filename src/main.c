@@ -26,6 +26,7 @@
 #else
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <time.h>
 #include <unistd.h>
 #endif
 
@@ -161,6 +162,14 @@ static bool SmCustomRendererEnabled(void) {
   return g_sm_video.enhanced || g_sm_video.fps_enabled;
 }
 static double SmMonotonicSeconds(void) {
+#if defined(__linux__)
+  /* Match the clock used by Linux sleep/audio scheduling. SDL's performance
+   * counter uses MONOTONIC_RAW, which excludes frequency corrections: on a
+   * drifting VM it can pace the guest slower than the audio device. */
+  struct timespec now;
+  if (clock_gettime(CLOCK_MONOTONIC, &now) == 0)
+    return (double)now.tv_sec + (double)now.tv_nsec / 1e9;
+#endif
   return (double)SDL_GetPerformanceCounter() / SDL_GetPerformanceFrequency();
 }
 /* Opt-in wall-time diagnostics. No guest state is sampled or changed here.
@@ -712,6 +721,12 @@ static uint8 *g_audiobuffer, *g_audiobuffer_cur, *g_audiobuffer_end;
 static int g_frames_per_block;
 static uint8 g_audio_channels;
 static SDL_AudioDeviceID g_audio_device;
+/* Only the thread executing guest work may wait for the audio consumer. */
+static _Thread_local bool g_audio_producer_active;
+static _Thread_local unsigned g_apu_lock_depth;
+static bool g_audio_primed;  /* protected by g_audio_mutex */
+#define SM_AUDIO_PREFILL 2136u
+#define SM_AUDIO_HIGH_WATER 4096u
 #if SNESRECOMP_SDL3
 /* SDL3 replaced the pull callback with an SDL_AudioStream the app pushes into,
  * so the mixer needs a scratch buffer sized to whatever the stream asks for. */
@@ -722,9 +737,27 @@ static size_t g_audio_stream_buffer_size;
 
 void RtlApuLock(void) {
   SDL_LockMutex(g_audio_mutex);
+  ++g_apu_lock_depth;
 }
 
 void RtlApuUnlock(void) {
+  --g_apu_lock_depth;
+  if (g_apu_lock_depth == 0 && g_audio_producer_active &&
+      dsp_available(g_snes->apu->dsp) > SM_AUDIO_HIGH_WATER) {
+    /* Fast hosts can generate a multi-frame loader's PCM in milliseconds.
+     * Let the device drain it before the bounded ring overflows. Always
+     * release the mutex while waiting, and stop waiting if the device stalls. */
+    double limit = SmMonotonicSeconds() + 0.25;
+    while (dsp_available(g_snes->apu->dsp) > SM_AUDIO_HIGH_WATER) {
+      SDL_UnlockMutex(g_audio_mutex);
+      SDL_Delay(1);
+      SDL_LockMutex(g_audio_mutex);
+      if (SmMonotonicSeconds() >= limit) {
+        g_audio_producer_active = false;
+        break;
+      }
+    }
+  }
   SDL_UnlockMutex(g_audio_mutex);
 }
 
@@ -739,7 +772,19 @@ static void FillAudioBuffer(Uint8 *stream, int len) {
   if (!snesrecomp_sdl_lock_mutex(g_audio_mutex)) Die("Mutex lock failed!");
   while (len != 0) {
     if (g_audiobuffer_end - g_audiobuffer_cur == 0) {
-      RtlRenderAudio((int16 *)g_audiobuffer, g_frames_per_block, g_audio_channels);
+      uint32_t available = dsp_available(g_snes->apu->dsp);
+      if (!g_audio_primed && available < SM_AUDIO_PREFILL) {
+        /* Startup/save-load starvation needs a cushion before playback
+         * resumes. Retain all native PCM; count the undelivered output just
+         * like any other underrun rather than hiding it from diagnostics. */
+        memset(g_audiobuffer, 0, g_frames_per_block * g_audio_channels * sizeof(int16));
+        audio_trace_on_output_underflow(available, g_frames_per_block);
+      } else {
+        g_audio_primed = true;
+        RtlRenderAudio((int16 *)g_audiobuffer, g_frames_per_block, g_audio_channels);
+        if (dsp_available(g_snes->apu->dsp) < 4)
+          g_audio_primed = false;
+      }
       g_audiobuffer_cur = g_audiobuffer;
       g_audiobuffer_end = g_audiobuffer + g_frames_per_block * g_audio_channels * sizeof(int16);
     }
@@ -1824,6 +1869,7 @@ error_reading:;
     double profile_start = SmProfileStart();
     double audio_probe_start = audio_probe ? SmMonotonicSeconds() : 0;
     if (SmCustomRendererEnabled()) SmRendererLatchObjectState(g_ram);
+    g_audio_producer_active = paced_realtime && g_audio_device != 0;
     RtlRunFrame(inputs | GetActiveControllers() | debug_server_get_controller_active_mask());
     ApplyScriptForcePokes();
     SmProfileEnd(kSmProfileGuest, profile_start);
@@ -1875,6 +1921,7 @@ error_reading:;
 
     profile_start = SmProfileStart();
     SmCaptureSimulationFrame(frameCtr);
+    g_audio_producer_active = false;
     SmProfileEnd(kSmProfileRaster, profile_start);
     profile_start = SmProfileStart();
     if (state_trace)
