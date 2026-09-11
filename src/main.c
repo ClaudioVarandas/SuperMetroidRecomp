@@ -175,7 +175,7 @@ static double SmMonotonicSeconds(void) {
 /* Opt-in wall-time diagnostics. No guest state is sampled or changed here.
  * Values include preemption/lock waits and are not CPU-time measurements. */
 enum { kSmProfileGuest, kSmProfileRaster, kSmProfileAcquire,
-       kSmProfileCompose, kSmProfilePresent, kSmProfileTrace,
+       kSmProfileCompose, kSmProfilePresent, kSmProfileTrace, kSmProfileAudioTrace,
        kSmProfileEvents, kSmProfileWait, kSmProfileCount };
 static bool g_sm_profile;
 static unsigned g_sm_profile_frame;
@@ -1696,6 +1696,10 @@ error_reading:;
    * PCM to the transition rather than boot or loading the save itself. */
   const char *audio_probe_path = getenv("SM_AUDIO_PROBE");
   FILE *audio_probe = audio_probe_path ? fopen(audio_probe_path, "w") : NULL;
+  /* Keep bounded doorway probes in memory until close: frequent small writes
+   * can block behind filesystem/antivirus work and create the very underruns
+   * being measured. Longer sessions flush this buffer periodically. */
+  if (audio_probe) setvbuf(audio_probe, NULL, _IOFBF, 1024 * 1024);
   if (audio_probe) fprintf(audio_probe, "frame,seconds,guest_ms,state,door_step,room,master,port_clock,guest_anchor,target_anchor,last_guest,last_target,produced,consumed,underflows,occupancy,missing_frames,dropped,output_rate\n");
   uint64_t presentations = 0;
   bool profile_requested = getenv("SM_PROFILE") && atoi(getenv("SM_PROFILE")) != 0;
@@ -1887,6 +1891,7 @@ error_reading:;
     ApplyScriptForcePokes();
     SmProfileEnd(kSmProfileGuest, profile_start);
     if (audio_probe) {
+      profile_start = SmProfileStart();
       double now = SmMonotonicSeconds();
       AudioTraceStats st;
       audio_trace_get_stats(&st);
@@ -1902,6 +1907,7 @@ error_reading:;
           (unsigned long long)st.consumed, (unsigned long long)st.output_underflows, st.occupancy_current,
           (unsigned long long)st.output_missing_frames,
           (unsigned long long)st.dropped, audio_output_rate);
+      SmProfileEnd(kSmProfileAudioTrace, profile_start);
     }
 
 #ifdef ENABLE_ORACLE_BACKEND
@@ -1975,7 +1981,7 @@ error_reading:;
     host_report_breadcrumb("video profile window: first=%u last=%u seconds=%.6f presentations=%u",
         profile_first, frameCtr, profile_seconds, g_sm_timings[kSmProfilePresent].count);
     static const char *names[kSmProfileCount] = {
-      "guest", "raster-capture", "surface-acquire", "compose", "upload-present", "state-trace",
+      "guest", "raster-capture", "surface-acquire", "compose", "upload-present", "state-trace", "audio-trace",
       "event-pump", "deadline-wait"
     };
     for (unsigned i = 0; i < kSmProfileCount; ++i)
