@@ -26,10 +26,13 @@
 #else
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <time.h>
 #include <unistd.h>
 #endif
 
 #include "snes/ppu.h"
+#include "snes/apu.h"
+#include "audio_trace.h"
 #include "snes/ws_shadow.h"
 
 #include "types.h"
@@ -159,12 +162,21 @@ static bool SmCustomRendererEnabled(void) {
   return g_sm_video.enhanced || g_sm_video.fps_enabled;
 }
 static double SmMonotonicSeconds(void) {
+#if defined(__linux__)
+  /* Match the clock used by Linux sleep/audio scheduling. SDL's performance
+   * counter uses MONOTONIC_RAW, which excludes frequency corrections: on a
+   * drifting VM it can pace the guest slower than the audio device. */
+  struct timespec now;
+  if (clock_gettime(CLOCK_MONOTONIC, &now) == 0)
+    return (double)now.tv_sec + (double)now.tv_nsec / 1e9;
+#endif
   return (double)SDL_GetPerformanceCounter() / SDL_GetPerformanceFrequency();
 }
 /* Opt-in wall-time diagnostics. No guest state is sampled or changed here.
  * Values include preemption/lock waits and are not CPU-time measurements. */
 enum { kSmProfileGuest, kSmProfileRaster, kSmProfileAcquire,
-       kSmProfileCompose, kSmProfilePresent, kSmProfileTrace, kSmProfileCount };
+       kSmProfileCompose, kSmProfilePresent, kSmProfileTrace, kSmProfileAudioTrace,
+       kSmProfileEvents, kSmProfileWait, kSmProfileCount };
 static bool g_sm_profile;
 static unsigned g_sm_profile_frame;
 static struct { double total, maximum; unsigned count, maximum_frame; } g_sm_timings[kSmProfileCount];
@@ -182,6 +194,7 @@ static void SmProfileEnd(unsigned stage, double start) {
   ++g_sm_timings[stage].count;
 }
 static void SmWaitUntil(double deadline) {
+  double profile_start = SmProfileStart();
   /* Same short deadline wait used by F-Zero. A fixed 1ms sleep on every
    * presentation-only iteration unnecessarily overshoots near deadlines. */
   double now = SmMonotonicSeconds();
@@ -193,6 +206,7 @@ static void SmWaitUntil(double deadline) {
       SDL_Delay(0);
     now = SmMonotonicSeconds();
   }
+  SmProfileEnd(kSmProfileWait, profile_start);
 }
 static double SmDisplayRefresh(void) {
 #if SNESRECOMP_SDL3
@@ -707,6 +721,15 @@ static uint8 *g_audiobuffer, *g_audiobuffer_cur, *g_audiobuffer_end;
 static int g_frames_per_block;
 static uint8 g_audio_channels;
 static SDL_AudioDeviceID g_audio_device;
+/* Only the thread executing guest work may wait for the audio consumer. */
+static _Thread_local bool g_audio_producer_active;
+static _Thread_local unsigned g_apu_lock_depth;
+static _Thread_local bool g_audio_consumer_stalled;
+static _Thread_local uint64_t g_audio_stalled_callback;
+static uint64_t g_audio_callback_count;  /* protected by g_audio_mutex */
+static bool g_audio_primed;  /* protected by g_audio_mutex */
+#define SM_AUDIO_PREFILL 2136u
+#define SM_AUDIO_HIGH_WATER 4096u
 #if SNESRECOMP_SDL3
 /* SDL3 replaced the pull callback with an SDL_AudioStream the app pushes into,
  * so the mixer needs a scratch buffer sized to whatever the stream asks for. */
@@ -717,9 +740,36 @@ static size_t g_audio_stream_buffer_size;
 
 void RtlApuLock(void) {
   SDL_LockMutex(g_audio_mutex);
+  ++g_apu_lock_depth;
 }
 
 void RtlApuUnlock(void) {
+  --g_apu_lock_depth;
+  if (g_apu_lock_depth == 0 && g_audio_producer_active &&
+      g_audio_consumer_stalled &&
+      g_audio_callback_count != g_audio_stalled_callback)
+    g_audio_consumer_stalled = false;
+  if (g_apu_lock_depth == 0 && g_audio_producer_active &&
+      !g_audio_consumer_stalled &&
+      dsp_available(g_snes->apu->dsp) > SM_AUDIO_HIGH_WATER) {
+    /* Fast hosts can generate a multi-frame loader's PCM in milliseconds.
+     * Let the device drain it before the bounded ring overflows. Always
+     * release the mutex while waiting, and stop waiting if the device stalls. */
+    double limit = SmMonotonicSeconds() + 0.25;
+    while (dsp_available(g_snes->apu->dsp) > SM_AUDIO_HIGH_WATER) {
+      SDL_UnlockMutex(g_audio_mutex);
+      SDL_Delay(1);
+      SDL_LockMutex(g_audio_mutex);
+      if (SmMonotonicSeconds() >= limit) {
+        /* A disconnected device must not add this timeout to every frame.
+         * Rearm only after the consumer has actually made progress. */
+        g_audio_consumer_stalled = true;
+        g_audio_stalled_callback = g_audio_callback_count;
+        g_audio_producer_active = false;
+        break;
+      }
+    }
+  }
   SDL_UnlockMutex(g_audio_mutex);
 }
 
@@ -732,9 +782,22 @@ static void FillAudioBuffer(Uint8 *stream, int len) {
   if (SDL_AtomicCAS(&first_cb, 0, 1))
     host_report_breadcrumb("first audio callback (len=%d)", len);
   if (!snesrecomp_sdl_lock_mutex(g_audio_mutex)) Die("Mutex lock failed!");
+  ++g_audio_callback_count;
   while (len != 0) {
     if (g_audiobuffer_end - g_audiobuffer_cur == 0) {
-      RtlRenderAudio((int16 *)g_audiobuffer, g_frames_per_block, g_audio_channels);
+      uint32_t available = dsp_available(g_snes->apu->dsp);
+      if (!g_audio_primed && available < SM_AUDIO_PREFILL) {
+        /* Startup/save-load starvation needs a cushion before playback
+         * resumes. Retain all native PCM; count the undelivered output just
+         * like any other underrun rather than hiding it from diagnostics. */
+        memset(g_audiobuffer, 0, g_frames_per_block * g_audio_channels * sizeof(int16));
+        audio_trace_on_output_underflow(available, g_frames_per_block);
+      } else {
+        g_audio_primed = true;
+        RtlRenderAudio((int16 *)g_audiobuffer, g_frames_per_block, g_audio_channels);
+        if (dsp_available(g_snes->apu->dsp) < 4)
+          g_audio_primed = false;
+      }
       g_audiobuffer_cur = g_audiobuffer;
       g_audiobuffer_end = g_audiobuffer + g_frames_per_block * g_audio_channels * sizeof(int16);
     }
@@ -1498,6 +1561,7 @@ error_reading:;
   g_spc_player->initialize(g_spc_player);
   host_report_breadcrumb("SPC player initialized");
 
+  int audio_output_rate = 0;
   if (g_config.enable_audio) {
     /* Enumerate output devices into the breadcrumb ring: which device
      * SDL picks (and what else was available) is exactly the per-machine
@@ -1552,6 +1616,7 @@ error_reading:;
     /* The consumer converts the SPC's native 32040 Hz onto this rate and
      * cannot infer it; see RtlSetAudioOutputRate in common_rtl.h. */
     RtlSetAudioOutputRate(have.freq);
+    audio_output_rate = have.freq;
     g_frames_per_block = (534 * have.freq + 32040 / 2) / 32040;
     g_audiobuffer = (uint8 *)calloc(g_frames_per_block * have.channels * sizeof(int16), 1);
     host_report_breadcrumb(
@@ -1619,12 +1684,23 @@ error_reading:;
   if (framedump_dir)
     FrameDump_Init(framedump_dir);
 
+  RtlEnableExtendedFrameTiming();
   bool running = true;
   uint32 frameCtr = 0;
   const char *run_frames_env = getenv("SM_RUN_FRAMES");
   unsigned run_frames = run_frames_env ? (unsigned)strtoul(run_frames_env, NULL, 10) : 0;
   const char *trace_path = getenv("SM_STATE_TRACE");
   FILE *state_trace = trace_path ? fopen(trace_path, "w") : NULL;
+  /* Optional production-path measurement. Sample after guest execution so a
+   * trace proves that the saved doorway was crossed, and attributes missing
+   * PCM to the transition rather than boot or loading the save itself. */
+  const char *audio_probe_path = getenv("SM_AUDIO_PROBE");
+  FILE *audio_probe = audio_probe_path ? fopen(audio_probe_path, "w") : NULL;
+  /* Keep bounded doorway probes in memory until close: frequent small writes
+   * can block behind filesystem/antivirus work and create the very underruns
+   * being measured. Longer sessions flush this buffer periodically. */
+  if (audio_probe) setvbuf(audio_probe, NULL, _IOFBF, 1024 * 1024);
+  if (audio_probe) fprintf(audio_probe, "frame,seconds,guest_ms,state,door_step,room,master,port_clock,guest_anchor,target_anchor,last_guest,last_target,produced,consumed,underflows,occupancy,missing_frames,dropped,output_rate\n");
   uint64_t presentations = 0;
   bool profile_requested = getenv("SM_PROFILE") && atoi(getenv("SM_PROFILE")) != 0;
   unsigned profile_first = getenv("SM_PROFILE_START_FRAME")
@@ -1649,6 +1725,7 @@ error_reading:;
      * whole crash-capture pipeline (minidump + report + crash copy). */
     host_report_crash_test_tick();
 
+    double event_profile_start = SmProfileStart();
     while (SDL_PollEvent(&event)) {
       switch (event.type) {
       case SDL_CONTROLLERDEVICEADDED:
@@ -1705,6 +1782,7 @@ error_reading:;
       }
     }
 
+    SmProfileEnd(kSmProfileEvents, event_profile_start);
     if (g_paused != audiopaused) {
       audiopaused = g_paused;
       SetAudioPaused(audiopaused);
@@ -1806,10 +1884,31 @@ error_reading:;
       profile_window_start = SmMonotonicSeconds();
     }
     double profile_start = SmProfileStart();
+    double audio_probe_start = audio_probe ? SmMonotonicSeconds() : 0;
     if (SmCustomRendererEnabled()) SmRendererLatchObjectState(g_ram);
+    g_audio_producer_active = paced_realtime && g_audio_device != 0;
     RtlRunFrame(inputs | GetActiveControllers() | debug_server_get_controller_active_mask());
     ApplyScriptForcePokes();
     SmProfileEnd(kSmProfileGuest, profile_start);
+    if (audio_probe) {
+      profile_start = SmProfileStart();
+      double now = SmMonotonicSeconds();
+      AudioTraceStats st;
+      audio_trace_get_stats(&st);
+      Apu *apu = g_snes->apu;
+      fprintf(audio_probe, "%d,%.6f,%.3f,%u,%04x,%04x,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%u,%llu,%llu,%d\n",
+          snes_frame_counter, now-run_start, (now-audio_probe_start)*1000,
+          g_ram[0x998] | g_ram[0x999]<<8, g_ram[0x99c] | g_ram[0x99d]<<8,
+          g_ram[0x79b] | g_ram[0x79c]<<8,
+          (unsigned long long)g_cpu.master_cycles,
+          (unsigned long long)apu->portClock, (unsigned long long)apu->portGuestAnchor,
+          (unsigned long long)apu->portTargetAnchor, (unsigned long long)apu->portLastGuest,
+          (unsigned long long)apu->portLastTarget, (unsigned long long)st.produced,
+          (unsigned long long)st.consumed, (unsigned long long)st.output_underflows, st.occupancy_current,
+          (unsigned long long)st.output_missing_frames,
+          (unsigned long long)st.dropped, audio_output_rate);
+      SmProfileEnd(kSmProfileAudioTrace, profile_start);
+    }
 
 #ifdef ENABLE_ORACLE_BACKEND
     // Step the oracle emulator with the same input. The runner's per-player
@@ -1841,6 +1940,7 @@ error_reading:;
 
     profile_start = SmProfileStart();
     SmCaptureSimulationFrame(frameCtr);
+    g_audio_producer_active = false;
     SmProfileEnd(kSmProfileRaster, profile_start);
     profile_start = SmProfileStart();
     if (state_trace)
@@ -1851,7 +1951,8 @@ error_reading:;
     if (paced_realtime) {
       uint8 game_state = g_ram[0x0998];
       bool door_loading = game_state >= 9 && game_state <= 11;
-      SmClockSimulationDone(&video_clock, SmMonotonicSeconds(), door_loading);
+      SmClockSimulationDone(&video_clock, SmMonotonicSeconds(), door_loading,
+                            RtlLastFramePeriods());
     }
     else
       SmClockReset(&video_clock, SmMonotonicSeconds(), presentation_hz);
@@ -1871,6 +1972,7 @@ error_reading:;
   }
 
   if (state_trace) fclose(state_trace);
+  if (audio_probe) fclose(audio_probe);
   host_report_breadcrumb("video totals: simulations=%u presentations=%llu seconds=%.3f",
                          frameCtr, (unsigned long long)presentations,
                          SmMonotonicSeconds() - run_start);
@@ -1879,7 +1981,8 @@ error_reading:;
     host_report_breadcrumb("video profile window: first=%u last=%u seconds=%.6f presentations=%u",
         profile_first, frameCtr, profile_seconds, g_sm_timings[kSmProfilePresent].count);
     static const char *names[kSmProfileCount] = {
-      "guest", "raster-capture", "surface-acquire", "compose", "upload-present", "state-trace"
+      "guest", "raster-capture", "surface-acquire", "compose", "upload-present", "state-trace", "audio-trace",
+      "event-pump", "deadline-wait"
     };
     for (unsigned i = 0; i < kSmProfileCount; ++i)
       host_report_breadcrumb("video profile: stage=%s count=%u total_ms=%.3f mean_ms=%.3f max_ms=%.3f max_frame=%u",

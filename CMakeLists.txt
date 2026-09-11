@@ -38,6 +38,8 @@ if(BUILD_TESTING AND NOT ANDROID)
     target_include_directories(ppu_window_test PRIVATE
         ${SNESRECOMP_ROOT}/runner/src)
     add_test(NAME ppu_widescreen_windows COMMAND ppu_window_test)
+    add_test(NAME sm_door_audio_trace
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/door_audio_trace_test.py)
 
 endif()
 

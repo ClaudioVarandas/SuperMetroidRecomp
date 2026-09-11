@@ -39,7 +39,7 @@ static void clock_invariance(void) {
     SmClockReset(&clock,0,rates[r]);
     for (int ms=0;ms<=10000;++ms) {
       double now=ms/1000.0;
-      while (SmClockSimulationDue(&clock,now)) SmClockSimulationDone(&clock,now,false);
+      while (SmClockSimulationDue(&clock,now)) SmClockSimulationDone(&clock,now,false,1);
       if (SmClockPresentationDue(&clock,now)) SmClockPresentationDone(&clock,now);
       double alpha=SmClockAlpha(&clock,now);
       assert(alpha >= 0 && alpha <= 1);
@@ -51,12 +51,21 @@ static void clock_invariance(void) {
   SmClockReset(&stalled,0,144);
   SmClockPresentationDone(&stalled,5);
   assert(stalled.simulation_frames == 0 && SmClockSimulationDue(&stalled,5));
-  while(SmClockSimulationDue(&stalled,5)) SmClockSimulationDone(&stalled,5,false);
+  while(SmClockSimulationDue(&stalled,5)) SmClockSimulationDone(&stalled,5,false,1);
   assert(stalled.simulation_frames == 1); /* Realtime play must discard stalled wall-time debt. */
   SmClock loading;
   SmClockReset(&loading,0,144);
-  while(SmClockSimulationDue(&loading,5)) SmClockSimulationDone(&loading,5,true);
+  while(SmClockSimulationDue(&loading,5)) SmClockSimulationDone(&loading,5,true,1);
   assert(loading.simulation_frames == 301); /* Door loading deliberately repays its audio debt. */
+  /* A loader that executed 18 hardware periods already generated their
+   * audio. Waiting those periods must not trigger 17 extra game iterations. */
+  SmClock extended;
+  SmClockReset(&extended,0,165);
+  SmClockSimulationDone(&extended,0.23,true,18);
+  assert(fabs(extended.next_simulation - 18 / SM_SIMULATION_HZ) < 1e-9);
+  assert(!SmClockSimulationDue(&extended,0.29));
+  SmClockSimulationDone(&extended,18 / SM_SIMULATION_HZ,false,1);
+  assert(fabs(extended.next_simulation - 19 / SM_SIMULATION_HZ) < 1e-9);
   assert(SmPresentationHz(0,165) == 165);
   assert(SmPresentationHz(0,1000) == 360);
   assert(SmPresentationHz(0,NAN) == 60);

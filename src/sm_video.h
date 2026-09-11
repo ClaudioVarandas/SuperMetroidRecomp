@@ -55,7 +55,8 @@ typedef struct SmClock {
 } SmClock;
 void SmClockReset(SmClock *clock, double now, double presentation_hz);
 bool SmClockSimulationDue(const SmClock *clock, double now);
-void SmClockSimulationDone(SmClock *clock, double now, bool preserve_debt);
+void SmClockSimulationDone(SmClock *clock, double now, bool preserve_debt,
+                           double elapsed_periods);
 bool SmClockPresentationDue(const SmClock *clock, double now);
 void SmClockPresentationDone(SmClock *clock, double now);
 double SmClockAlpha(const SmClock *clock, double now);

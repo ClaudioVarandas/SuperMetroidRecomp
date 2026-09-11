@@ -133,8 +133,9 @@ void SmClockReset(SmClock *c, double now, double hz) {
 bool SmClockSimulationDue(const SmClock *c, double now) {
   return now >= c->next_simulation;
 }
-void SmClockSimulationDone(SmClock *c, double now, bool preserve_debt) {
-  double deadline = c->next_simulation + 1.0 / SM_SIMULATION_HZ;
+void SmClockSimulationDone(SmClock *c, double now, bool preserve_debt,
+                           double elapsed_periods) {
+  double deadline = c->next_simulation + elapsed_periods / SM_SIMULATION_HZ;
   /* Keep ordinary sub-frame scheduling jitter on the original phase. A door
    * loader may preserve its backlog so its non-interactive frames refill the
    * guest-driven audio queue; all ordinary gameplay drops stale work. */
