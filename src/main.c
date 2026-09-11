@@ -1737,11 +1737,12 @@ error_reading:;
     if (SmMonotonicSeconds() - before_debug_wait > 0.05)
       SmClockReset(&video_clock, SmMonotonicSeconds(), presentation_hz);
 
-    /* Door loading can take longer than a frame. Realtime play must not repay
-     * that wall-time debt by simulating several guest frames back-to-back:
-     * doing so visibly speeds up Samus and advances the SPC audio at the same
-     * accelerated rate. Presentation-only iterations remain custom-renderer
-     * only, because they reuse a captured simulation frame. */
+    /* Door loading can take longer than a frame. Keep its debt only while the
+     * guest is in its non-interactive transition states: those frames refill
+     * the guest-driven SPC queue. The moment state 8 gameplay returns, drop
+     * any remainder so Samus can never burst forward after the doorway.
+     * Presentation-only iterations remain custom-renderer only, because they
+     * reuse a captured simulation frame. */
     bool paced_realtime = !g_turbo && !g_config.disable_frame_delay;
     bool paced_custom = SmCustomRendererEnabled() && paced_realtime;
     double video_now = SmMonotonicSeconds();
@@ -1847,8 +1848,11 @@ error_reading:;
               frameCtr, crc32_compute(g_ram, 0x20000), g_cpu.A, g_cpu.X, g_cpu.Y,
               g_cpu.S, g_cpu.D, g_cpu.DB, g_cpu.PB, g_cpu.P);
     SmProfileEnd(kSmProfileTrace, profile_start);
-    if (paced_realtime)
-      SmClockSimulationDone(&video_clock, SmMonotonicSeconds());
+    if (paced_realtime) {
+      uint8 game_state = g_ram[0x0998];
+      bool door_loading = game_state >= 9 && game_state <= 11;
+      SmClockSimulationDone(&video_clock, SmMonotonicSeconds(), door_loading);
+    }
     else
       SmClockReset(&video_clock, SmMonotonicSeconds(), presentation_hz);
     if (!g_snes->disableRender &&
