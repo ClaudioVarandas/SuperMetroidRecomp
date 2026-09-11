@@ -64,7 +64,8 @@ def analyze(rows, post_frames=120, output_rate=None):
             "post_fps": round(delta("frame", after, post)/elapsed, 3),
             "produced_samples": delta("produced", before, after),
             "longest_no_pcm_ms": round(zero_ms, 3),
-            **({"dropped_samples": delta("dropped", before, after)}
+            **({"dropped_samples": delta("dropped", before, after),
+                "post_dropped_samples": delta("dropped", after, post)}
                if "dropped" in before else {}),
         })
     return results
@@ -87,6 +88,8 @@ def main():
         return 2
     passed = all(r["missing_ms"] <= args.max_missing_ms and
                  r["post_missing_ms"] <= args.max_missing_ms and
+                 r.get("dropped_samples", 0) == 0 and
+                 r.get("post_dropped_samples", 0) == 0 and
                  r["post_fps"] <= args.max_post_fps for r in results)
     print(json.dumps({"valid": True, "passed": passed, "transitions": results}, indent=2))
     return 0 if passed else 1

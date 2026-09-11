@@ -15,7 +15,7 @@ path to `tools/door_audio_repro.txt`. Paths to config, ROM cache, and saves are
 anchored next to the executable.
 
 Run `python tools/check_door_audio.py path/to/trace.csv` afterward. A clean run
-exits zero. Missing guest audio or excessive post-exit FPS exits one. An invalid
+exits zero. Missing/dropped guest audio or excessive post-exit FPS exits one. An invalid
 fixture (no actual door, same room after exit, incomplete post-exit window, or no
 audio sample rate) exits two. The checker excludes all counters accumulated
 before entering the door, including boot and loading the save.
@@ -91,11 +91,57 @@ reset loaded the save, then reset erased it. That run stayed at the title screen
 The checked-in fixture loads after boot and the checker explicitly rejects this
 false positive.
 
-## Scope
+## Clock correction
 
-The retained changes add measurement and fixture validation only. No further
-audio or pacing fix is claimed. The title-specific LLE frame driver and shared
-APU timestamp mapping need consistent treatment of guest work that spans several
-hardware frames, while preserving multi-frame SPC upload handshakes and avoiding
-extra audio production or post-exit speed-up. Track that architectural work in
-`beads-8wg.2.33`; track the player-visible doorway regression in `beads-8wg.6.5`.
+The ordinary-cartridge interpreter was still advancing the SPC through relative
+catch-up in addition to the absolute frame clock. Suppressing that path alone
+removed the clock lead, but exposed the other half of the bug: long room-loading
+code without APU port accesses produced only one frame's PCM at return. Three
+crossings then lost about 412 ms each. That experiment was superseded.
+
+The retained shared-runner correction synchronizes the absolute clock in the
+interpreter's existing periodic batches, including work without port accesses.
+The end of an iteration is the greater of one nominal frame and its executed
+guest duration. The next iteration starts there, so a multi-frame loader cannot
+leave the SPC waiting for a backward frame-count timestamp. NMI-disabled upload
+handshakes remain unclamped. Unmapped startup retains relative catch-up until
+APU port time is established.
+
+Hosts opt in with `RtlEnableExtendedFrameTiming()` and must pace each iteration
+using `RtlLastFramePeriods()`. Super Metroid now does that. Hosts that have not
+adopted the duration contract retain their existing behavior, including SA-1's
+existing absolute-clock policy. No sound is generated from wall time, resampler
+speed is unchanged, and the normal-play policy still discards stale wall-time
+debt. This fixes shared timing used by the title's LLE driver; it does not migrate
+the entire driver to the hardware-frame scheduler.
+
+Production traces `door-audio-final-clock-c.csv` and `door-audio-final-clock-d.csv`
+contain six consecutive clean crossings:
+zero missing output during and after the door, zero dropped samples, and zero
+frames without newly produced PCM. Post-exit speed is 60.068-60.076 FPS. The
+transition now produces 94,602 samples over about 2.947 seconds, accounting for
+the loader's guest duration instead of forcing it into one host frame.
+The Debug build with TCP/trace enabled also passed the fixture with zero missing
+or dropped output, zero no-PCM frames, and 60.073 FPS after exit
+(`build-codex-debug-dev/door-audio-debug-clock.csv`). Its largest guest call was
+298 ms; audio production continued throughout that work.
+
+Earlier candidate replays also recorded intermittent 123-821 ms gaps *between*
+guest calls, including ordinary gameplay. Those runs are retained as
+`door-audio-final-clock-a.csv` and `door-audio-final-clock-b.csv`; they are not
+counted as clean passes. The B-run guest/raster/presentation timings do not
+account for those pauses. The optional `SM_PROFILE` report now measures the event
+pump and deadline waits as well, to help attribute any recurrence. The clean C
+run measured at most 0.219 ms in the event pump and 73.839 ms in a deadline wait
+(the latter includes intentional waiting after an extended loader).
+
+Regression tests run the real SPC for a synthetic 40-frame loader followed by 45
+short iterations, checking that each short iteration immediately produces 534
+samples. Interpreter tests cover periodic absolute sync without port accesses,
+no duplicate relative advancement, bootstrap progress, and legacy policy. The
+host-clock test verifies an 18-period loader advances its deadline by 18 periods
+and returns to ordinary pacing without a catch-up burst.
+
+Track shared timing in `beads-8wg.2.33` and the player-visible doorway regression
+in `beads-8wg.6.5`. Production measurements remain the acceptance gate; debug
+instrumentation can materially change available execution headroom.

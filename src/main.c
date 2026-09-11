@@ -166,7 +166,8 @@ static double SmMonotonicSeconds(void) {
 /* Opt-in wall-time diagnostics. No guest state is sampled or changed here.
  * Values include preemption/lock waits and are not CPU-time measurements. */
 enum { kSmProfileGuest, kSmProfileRaster, kSmProfileAcquire,
-       kSmProfileCompose, kSmProfilePresent, kSmProfileTrace, kSmProfileCount };
+       kSmProfileCompose, kSmProfilePresent, kSmProfileTrace,
+       kSmProfileEvents, kSmProfileWait, kSmProfileCount };
 static bool g_sm_profile;
 static unsigned g_sm_profile_frame;
 static struct { double total, maximum; unsigned count, maximum_frame; } g_sm_timings[kSmProfileCount];
@@ -184,6 +185,7 @@ static void SmProfileEnd(unsigned stage, double start) {
   ++g_sm_timings[stage].count;
 }
 static void SmWaitUntil(double deadline) {
+  double profile_start = SmProfileStart();
   /* Same short deadline wait used by F-Zero. A fixed 1ms sleep on every
    * presentation-only iteration unnecessarily overshoots near deadlines. */
   double now = SmMonotonicSeconds();
@@ -195,6 +197,7 @@ static void SmWaitUntil(double deadline) {
       SDL_Delay(0);
     now = SmMonotonicSeconds();
   }
+  SmProfileEnd(kSmProfileWait, profile_start);
 }
 static double SmDisplayRefresh(void) {
 #if SNESRECOMP_SDL3
@@ -1623,6 +1626,7 @@ error_reading:;
   if (framedump_dir)
     FrameDump_Init(framedump_dir);
 
+  RtlEnableExtendedFrameTiming();
   bool running = true;
   uint32 frameCtr = 0;
   const char *run_frames_env = getenv("SM_RUN_FRAMES");
@@ -1659,6 +1663,7 @@ error_reading:;
      * whole crash-capture pipeline (minidump + report + crash copy). */
     host_report_crash_test_tick();
 
+    double event_profile_start = SmProfileStart();
     while (SDL_PollEvent(&event)) {
       switch (event.type) {
       case SDL_CONTROLLERDEVICEADDED:
@@ -1715,6 +1720,7 @@ error_reading:;
       }
     }
 
+    SmProfileEnd(kSmProfileEvents, event_profile_start);
     if (g_paused != audiopaused) {
       audiopaused = g_paused;
       SetAudioPaused(audiopaused);
@@ -1879,7 +1885,8 @@ error_reading:;
     if (paced_realtime) {
       uint8 game_state = g_ram[0x0998];
       bool door_loading = game_state >= 9 && game_state <= 11;
-      SmClockSimulationDone(&video_clock, SmMonotonicSeconds(), door_loading);
+      SmClockSimulationDone(&video_clock, SmMonotonicSeconds(), door_loading,
+                            RtlLastFramePeriods());
     }
     else
       SmClockReset(&video_clock, SmMonotonicSeconds(), presentation_hz);
@@ -1908,7 +1915,8 @@ error_reading:;
     host_report_breadcrumb("video profile window: first=%u last=%u seconds=%.6f presentations=%u",
         profile_first, frameCtr, profile_seconds, g_sm_timings[kSmProfilePresent].count);
     static const char *names[kSmProfileCount] = {
-      "guest", "raster-capture", "surface-acquire", "compose", "upload-present", "state-trace"
+      "guest", "raster-capture", "surface-acquire", "compose", "upload-present", "state-trace",
+      "event-pump", "deadline-wait"
     };
     for (unsigned i = 0; i < kSmProfileCount; ++i)
       host_report_breadcrumb("video profile: stage=%s count=%u total_ms=%.3f mean_ms=%.3f max_ms=%.3f max_frame=%u",

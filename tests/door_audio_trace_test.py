@@ -44,6 +44,15 @@ class DoorTraceTest(unittest.TestCase):
         self.assertEqual(result["post_missing_ms"], 5)
         self.assertEqual(result["underflows"], 1)
 
+    def test_dropped_audio_is_measured_without_boot_drops(self):
+        rows = fixture()
+        for row in rows:
+            row["dropped"] = 1000 + (100 if row["frame"] >= 80 else 0)
+            row["dropped"] += 20 if row["frame"] >= 110 else 0
+        result = analyze(rows)[0]
+        self.assertEqual(result["dropped_samples"], 100)
+        self.assertEqual(result["post_dropped_samples"], 20)
+
 
 if __name__ == "__main__":
     unittest.main()
