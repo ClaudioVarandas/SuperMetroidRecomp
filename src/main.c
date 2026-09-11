@@ -724,6 +724,9 @@ static SDL_AudioDeviceID g_audio_device;
 /* Only the thread executing guest work may wait for the audio consumer. */
 static _Thread_local bool g_audio_producer_active;
 static _Thread_local unsigned g_apu_lock_depth;
+static _Thread_local bool g_audio_consumer_stalled;
+static _Thread_local uint64_t g_audio_stalled_callback;
+static uint64_t g_audio_callback_count;  /* protected by g_audio_mutex */
 static bool g_audio_primed;  /* protected by g_audio_mutex */
 #define SM_AUDIO_PREFILL 2136u
 #define SM_AUDIO_HIGH_WATER 4096u
@@ -743,6 +746,11 @@ void RtlApuLock(void) {
 void RtlApuUnlock(void) {
   --g_apu_lock_depth;
   if (g_apu_lock_depth == 0 && g_audio_producer_active &&
+      g_audio_consumer_stalled &&
+      g_audio_callback_count != g_audio_stalled_callback)
+    g_audio_consumer_stalled = false;
+  if (g_apu_lock_depth == 0 && g_audio_producer_active &&
+      !g_audio_consumer_stalled &&
       dsp_available(g_snes->apu->dsp) > SM_AUDIO_HIGH_WATER) {
     /* Fast hosts can generate a multi-frame loader's PCM in milliseconds.
      * Let the device drain it before the bounded ring overflows. Always
@@ -753,6 +761,10 @@ void RtlApuUnlock(void) {
       SDL_Delay(1);
       SDL_LockMutex(g_audio_mutex);
       if (SmMonotonicSeconds() >= limit) {
+        /* A disconnected device must not add this timeout to every frame.
+         * Rearm only after the consumer has actually made progress. */
+        g_audio_consumer_stalled = true;
+        g_audio_stalled_callback = g_audio_callback_count;
         g_audio_producer_active = false;
         break;
       }
@@ -770,6 +782,7 @@ static void FillAudioBuffer(Uint8 *stream, int len) {
   if (SDL_AtomicCAS(&first_cb, 0, 1))
     host_report_breadcrumb("first audio callback (len=%d)", len);
   if (!snesrecomp_sdl_lock_mutex(g_audio_mutex)) Die("Mutex lock failed!");
+  ++g_audio_callback_count;
   while (len != 0) {
     if (g_audiobuffer_end - g_audiobuffer_cur == 0) {
       uint32_t available = dsp_available(g_snes->apu->dsp);
