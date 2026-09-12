@@ -211,6 +211,9 @@ endif()
 # hooks. Before 2026-09 all of it was a 2,800-line private copy of the host in
 # src/main.c, ahead of the framework's in places and behind it in others.
 snesrecomp_target_desktop_host(SuperMetroidSNESRecomp TIER2)
+# rom.cfg at the repo root (git-ignored, the ROM's absolute path) is staged
+# beside the executable when none is there yet, so a launch opens on it.
+snesrecomp_target_rom_cache(SuperMetroidSNESRecomp)
 
 # ROM identity. rom_identity.txt is the one place the digests live: this turns
 # it into snesrecomp_rom_identity.h for src/main.c, and tools/regen.sh,
