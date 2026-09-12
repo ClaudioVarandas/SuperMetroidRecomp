@@ -443,6 +443,22 @@ first version of it passed vacuously (a real pad took player 1) and then
 pressed the SNES A instead of B -- both caught by the guest trace, which must
 be byte-identical with the test armed.
 
+## 2026-09-12 — a fresh scaffold did not boot: rendered from the wrong wizard
+
+Studio scaffolded Super Metroid again from scratch; it pinned snesrecomp main
+(host unit, shim templates) but its main.c/game_rtl.c/host_contract.c were
+the OLD templates: Studio ran the wizard from the sibling `~/GitHub/snesrecomp`
+checkout, which sits on a months-old branch, and rendered from that copy while
+the submodule came from the remote. The old game_rtl.c never delivers NMI, so
+game_state never left 0 (black frame; screenshot + WRAM trace). Fixes:
+snesrecomp bdcd4f5 (the wizard re-renders every template from the submodule
+it just pinned, takes the recomp-ui ref from there too, and a wizard older
+than the framework it pins fails with the token named); Studio 5077ed5 +
+ede4e80 (re-vendored wizard; new projects scaffold from the vendored copy
+unless SNESRECOMP_ROOT is set). Verified with a deliberately stale wizard copy
+(shim rendered, pinned main) and by re-rendering the on-disk scaffold from its
+pinned framework: boots to file select at frame 700.
+
 ## Open items
 
 1. **Next attract blocker** — the f2689 freeze is fixed and the demo now plays
