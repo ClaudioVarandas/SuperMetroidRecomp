@@ -838,6 +838,32 @@ static void PresentFrozenWithOverlay(void) {
                                0, draw_h - strip_h, draw_w, strip_h);
     }
   }
+  /* SM_OVERLAY_DUMP=<path>: write the composited overlay frame as a PPM.
+   * The overlays can only be driven by a human, so this is the only way to
+   * check that a panel actually reaches the screen rather than inferring it
+   * from the module reporting itself open. */
+  {
+    const char *dump = getenv("SM_OVERLAY_DUMP");
+    static int dumped = 0;
+    if (dump && !dumped && panel) {
+      FILE *f = fopen(dump, "wb");
+      if (f) {
+        fprintf(f, "P6\n%d %d\n255\n", draw_w, draw_h);
+        for (int y = 0; y < draw_h; y++) {
+          const uint32_t *row = (const uint32_t *)(pixel_buffer + (size_t)y * (size_t)pitch);
+          for (int x = 0; x < draw_w; x++) {
+            uint32_t p = row[x];
+            fputc((p >> 16) & 0xFF, f); fputc((p >> 8) & 0xFF, f); fputc(p & 0xFF, f);
+          }
+        }
+        fclose(f);
+        dumped = 1;
+        fprintf(stderr, "[overlay_dump] wrote %s (%dx%d, %s)\n", dump, draw_w, draw_h,
+                is_menu ? "save-state browser" : "rewind filmstrip");
+      }
+    }
+  }
+
   g_renderer_funcs.EndDraw();
 }
 
@@ -845,6 +871,14 @@ static void PresentFrozenWithOverlay(void) {
  * never calls RtlRunFrame and never calls the game's draw_ppu_frame, which is
  * what makes "save right here" a definite point in time. */
 static void RunSavestateMenuLoop(bool *running) {
+  /* Always on, and deliberately so: the guest is about to stop, and from the
+   * outside a deliberate freeze and a hang look identical. Whoever reads the
+   * log next should not have to guess which one they got -- and the player
+   * needs to be told which button leaves, because the answer is not Escape
+   * on a pad. */
+  unsigned frames = 0;
+  host_report_breadcrumb("save-state browser OPEN - guest frozen until it "
+                         "closes (pad B, or Escape/Backspace on the keyboard)");
   while (snes_savestate_menu_is_open() && *running) {
     SDL_Event event;
     while (SDL_PollEvent(&event)) {
@@ -871,7 +905,10 @@ static void RunSavestateMenuLoop(bool *running) {
     snes_savestate_menu_poll_nav(OverlayNavInputs(), SDL_GetTicks());
     PresentFrozenWithOverlay();
     SDL_Delay(8);
+    frames++;
   }
+  host_report_breadcrumb("save-state browser CLOSED after %u pumps - guest resuming",
+                         frames);
 }
 
 /* Rewind's modal pump. It needs its own: snes_rewind exposes step/commit/close
@@ -881,6 +918,9 @@ static void RunSavestateMenuLoop(bool *running) {
  * Enter or Space commits, Escape cancels, and the pad mirrors them. */
 static void RunRewindLoop(bool *running) {
   uint32 prev_pad = 0;
+  unsigned frames = 0;
+  host_report_breadcrumb("rewind filmstrip OPEN - guest frozen until it closes "
+                         "(pad B, or Escape; Left/Right scrub, A or Enter commits)");
   while (snes_rewind_is_open() && *running) {
     SDL_Event event;
     while (SDL_PollEvent(&event)) {
@@ -918,7 +958,10 @@ static void RunRewindLoop(bool *running) {
     }
     PresentFrozenWithOverlay();
     SDL_Delay(8);
+    frames++;
   }
+  host_report_breadcrumb("rewind filmstrip CLOSED after %u pumps - guest resuming",
+                         frames);
   SmRendererReset();
   g_sm_reset_clock = true;
 }
@@ -2101,6 +2144,28 @@ error_reading:;
      * immediately, every frame, and the game never advances again. That is
      * the lock-up, and a resting analog stick or a held shoulder button is
      * enough to trigger it. */
+    {
+      static long load_frame = -2;
+      if (load_frame == -2) {
+        const char *v = getenv("SM_OVERLAY_SELFTEST_LOADAT");
+        load_frame = (v && *v) ? strtol(v, NULL, 0) : -1;
+      }
+      if (load_frame >= 0 && (long)frameCtr == load_frame) {
+        fprintf(stderr, "[overlay_selftest] loading the state saved earlier, at frame %ld\n",
+                load_frame);
+        (void)snes_savestate_menu_poll_open(SNES_PAD_SELECT | SNES_PAD_R);
+        if (snes_savestate_menu_is_open()) {
+          uint32_t t = SDL_GetTicks();
+          snes_savestate_menu_poll_nav(SNES_PAD_A, t);     /* A = load */
+          snes_savestate_menu_poll_nav(0, t + 1);
+          snes_savestate_menu_close();
+          SmRendererReset();
+          g_sm_reset_clock = true;
+          fprintf(stderr, "[overlay_selftest] load issued\n");
+        }
+      }
+    }
+
     uint32 human = snes_savestate_menu_filter_guest_input(OverlayNavInputs());
     uint32 inputs = human | (g_gamepad[1].axis_buttons << 12);
     inputs |= TickScript();
@@ -2143,6 +2208,12 @@ error_reading:;
            * save and load, which is the path a player actually uses and the
            * one that reads as "it froze". Save/load are pad-only (X saves,
            * A loads), so this synthesizes those edges. */
+          if (getenv("SM_OVERLAY_SELFTEST_SAVEONLY")) {
+            uint32_t t = SDL_GetTicks();
+            fprintf(stderr, "[overlay_selftest] pad X (save) only\n");
+            snes_savestate_menu_poll_nav(SNES_PAD_X, t);
+            snes_savestate_menu_poll_nav(0, t + 1);
+          }
           if (getenv("SM_OVERLAY_SELFTEST_SAVELOAD")) {
             uint32_t t = SDL_GetTicks();
             fprintf(stderr, "[overlay_selftest] pad X (save)...\n");
