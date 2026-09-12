@@ -1,4 +1,5 @@
 #include "sm_mods.h"
+#include "host_clock.h"
 #include <assert.h>
 #include <limits.h>
 #include <math.h>
@@ -33,38 +34,40 @@ static void geometry(void) {
 }
 
 static void clock_invariance(void) {
+  /* The framework clock, parameterized by this title's simulation rate. The
+   * cases are the ones SmClock carried before it moved up. */
   const unsigned rates[] = {60,90,120,144,165,240,360};
   for (unsigned r=0;r<sizeof(rates)/sizeof(rates[0]);++r) {
-    SmClock clock;
-    SmClockReset(&clock,0,rates[r]);
+    SnesHostClock clock;
+    snes_host_clock_reset(&clock,0,SM_SIMULATION_HZ,rates[r]);
     for (int ms=0;ms<=10000;++ms) {
       double now=ms/1000.0;
-      while (SmClockSimulationDue(&clock,now)) SmClockSimulationDone(&clock,now,false,1);
-      if (SmClockPresentationDue(&clock,now)) SmClockPresentationDone(&clock,now);
-      double alpha=SmClockAlpha(&clock,now);
+      while (snes_host_clock_simulation_due(&clock,now)) snes_host_clock_simulation_done(&clock,now,false,1);
+      if (snes_host_clock_presentation_due(&clock,now)) snes_host_clock_presentation_done(&clock,now);
+      double alpha=snes_host_clock_alpha(&clock,now);
       assert(alpha >= 0 && alpha <= 1);
     }
     assert(clock.simulation_frames == 601);
     assert(clock.presentations >= rates[r]*10-1 && clock.presentations <= rates[r]*10+1);
   }
-  SmClock stalled;
-  SmClockReset(&stalled,0,144);
-  SmClockPresentationDone(&stalled,5);
-  assert(stalled.simulation_frames == 0 && SmClockSimulationDue(&stalled,5));
-  while(SmClockSimulationDue(&stalled,5)) SmClockSimulationDone(&stalled,5,false,1);
+  SnesHostClock stalled;
+  snes_host_clock_reset(&stalled,0,SM_SIMULATION_HZ,144);
+  snes_host_clock_presentation_done(&stalled,5);
+  assert(stalled.simulation_frames == 0 && snes_host_clock_simulation_due(&stalled,5));
+  while(snes_host_clock_simulation_due(&stalled,5)) snes_host_clock_simulation_done(&stalled,5,false,1);
   assert(stalled.simulation_frames == 1); /* Realtime play must discard stalled wall-time debt. */
-  SmClock loading;
-  SmClockReset(&loading,0,144);
-  while(SmClockSimulationDue(&loading,5)) SmClockSimulationDone(&loading,5,true,1);
+  SnesHostClock loading;
+  snes_host_clock_reset(&loading,0,SM_SIMULATION_HZ,144);
+  while(snes_host_clock_simulation_due(&loading,5)) snes_host_clock_simulation_done(&loading,5,true,1);
   assert(loading.simulation_frames == 301); /* Door loading deliberately repays its audio debt. */
   /* A loader that executed 18 hardware periods already generated their
    * audio. Waiting those periods must not trigger 17 extra game iterations. */
-  SmClock extended;
-  SmClockReset(&extended,0,165);
-  SmClockSimulationDone(&extended,0.23,true,18);
+  SnesHostClock extended;
+  snes_host_clock_reset(&extended,0,SM_SIMULATION_HZ,165);
+  snes_host_clock_simulation_done(&extended,0.23,true,18);
   assert(fabs(extended.next_simulation - 18 / SM_SIMULATION_HZ) < 1e-9);
-  assert(!SmClockSimulationDue(&extended,0.29));
-  SmClockSimulationDone(&extended,18 / SM_SIMULATION_HZ,false,1);
+  assert(!snes_host_clock_simulation_due(&extended,0.29));
+  snes_host_clock_simulation_done(&extended,18 / SM_SIMULATION_HZ,false,1);
   assert(fabs(extended.next_simulation - 19 / SM_SIMULATION_HZ) < 1e-9);
   assert(SmPresentationHz(0,165) == 165);
   assert(SmPresentationHz(0,1000) == 360);

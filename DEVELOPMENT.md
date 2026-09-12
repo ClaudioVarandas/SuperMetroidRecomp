@@ -396,6 +396,33 @@ focus and ate keystrokes — use the dummy SDL drivers for repro runs).
 Framework v2 suite 399/402 (3 pre-existing `test_emit_function_smoke`
 failures, emitter-side, untouched). **UNCOMMITTED.**
 
+## 2026-09-12 — the host is the framework's; main.c is a shim
+
+`src/main.c` (2,849 lines: launcher flow, ROM resolution, config, window,
+SDL/GL presenters, audio, gamepads, overlays, pacing clock, crash pipeline,
+scripted input) moved up into snesrecomp as `runner/src/desktop/host_main.c`
+(+ `host_clock.c`, the former SmClock with the rate as a parameter), linked
+by `snesrecomp_target_desktop_host(<target> [TIER2])`. main.c is now 250
+lines: a `SnesDesktopHostGame` descriptor with identity from
+`snesrecomp_rom_identity.h` and SM's hooks (custom renderer via
+prepare_frame/draw_frame, presentation rate, door-transition pacing debt,
+SPC player, Mods provider, SM_AUDIO_PROBE). The new-project templates
+(`main.c.in`, `host_contract.c.in`, `CMakeLists.txt.in`) produce the same
+shape, so the second on-disk scaffold (`SuperMetroidSNESRecomp`) rendered
+file select, options and the intro on the first build against this host —
+it had presented a black frame before because the working host lived only
+here.
+
+Verified: guest WRAM trace byte-identical to the pre-change binary over a
+1,900-frame scripted boot to game_state 8 (`multi.txt`, dummy drivers);
+identical again with the save-state browser opened, saved, loaded and closed
+at frame 700 (SNESRECOMP_OVERLAY_SELFTEST) — panel dumped at 512x448;
+screenshots at frames 700/1300 identical pixel counts between this repo and
+the scaffold; windowed SDL and OpenGL presenters both initialize and present
+(x11); ctest 8/8, framework v2 401/404 (the 3 pre-existing
+`test_emit_function_smoke` failures), new `test_host_clock` registered.
+Headless screenshots: `SNESRECOMP_SCREENSHOT=<ppm> SNESRECOMP_SCREENSHOT_FRAME=<n>`.
+
 ## Open items
 
 1. **Next attract blocker** — the f2689 freeze is fixed and the demo now plays

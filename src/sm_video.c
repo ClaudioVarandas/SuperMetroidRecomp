@@ -1,5 +1,6 @@
 /* Presentation geometry and cadence adapted from FZeroRecomp's custom renderer. */
 #include "sm_video.h"
+#include "host_clock.h"
 
 #include <errno.h>
 #include <math.h>
@@ -32,16 +33,10 @@ bool SmParseAspect(const char *text, SmAspect *aspect) {
   return false;
 }
 
-bool SmValidFps(unsigned fps) {
-  return fps == 0 || fps == 60 || fps == 90 || fps == 120 || fps == 144 ||
-         fps == 165 || fps == 240 || fps == 360;
-}
+bool SmValidFps(unsigned fps) { return snes_host_valid_fps(fps); }
 
 double SmPresentationHz(unsigned fps, double refresh) {
-  if (!SmValidFps(fps)) fps = 0;
-  if (fps) return fps;
-  if (!isfinite(refresh) || refresh < 1) return 60;
-  return fmin(refresh, 360);
+  return snes_host_presentation_hz(fps, refresh);
 }
 
 SmViewport SmCalculateViewport(const SmVideoSettings *s, int w, int h) {
@@ -124,39 +119,4 @@ bool SmVideoSave(const SmVideoSettings *s, const char *path) {
   }
   if (!ok) remove(temporary);
   return ok;
-}
-
-void SmClockReset(SmClock *c, double now, double hz) {
-  *c = (SmClock){.next_simulation = now, .next_presentation = now,
-                    .presentation_hz = isfinite(hz) && hz > 0 ? hz : 60};
-}
-bool SmClockSimulationDue(const SmClock *c, double now) {
-  return now >= c->next_simulation;
-}
-void SmClockSimulationDone(SmClock *c, double now, bool preserve_debt,
-                           double elapsed_periods) {
-  double deadline = c->next_simulation + elapsed_periods / SM_SIMULATION_HZ;
-  /* Keep ordinary sub-frame scheduling jitter on the original phase. A door
-   * loader may preserve its backlog so its non-interactive frames refill the
-   * guest-driven audio queue; all ordinary gameplay drops stale work. */
-  c->next_simulation = preserve_debt || now <= deadline
-      ? deadline : now + 1.0 / SM_SIMULATION_HZ;
-  ++c->simulation_frames;
-}
-bool SmClockPresentationDue(const SmClock *c, double now) {
-  return now >= c->next_presentation;
-}
-void SmClockPresentationDone(SmClock *c, double now) {
-  double period = 1.0 / c->presentation_hz;
-  double overdue = fmax(0, now - c->next_presentation);
-  uint64_t missed = (uint64_t)floor(overdue / period);
-  c->missed_presentations += missed;
-  c->next_presentation += (missed + 1) * period;
-  ++c->presentations;
-}
-double SmClockAlpha(const SmClock *c, double now) {
-  return fmax(0, fmin(1, 1 - (c->next_simulation - now) * SM_SIMULATION_HZ));
-}
-double SmClockNextDeadline(const SmClock *c) {
-  return fmin(c->next_simulation, c->next_presentation);
 }

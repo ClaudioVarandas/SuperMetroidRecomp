@@ -94,8 +94,10 @@ include(${RECOMP_UI_ROOT}/recomp_ui.cmake)
 
 if(BUILD_TESTING AND NOT ANDROID)
     add_executable(sm_video_test
-        tests/sm_video_test.c src/sm_video.c src/sm_mods.c)
-    target_include_directories(sm_video_test PRIVATE src ${RECOMP_UI_ROOT}/src)
+        tests/sm_video_test.c src/sm_video.c src/sm_mods.c
+        ${SNESRECOMP_ROOT}/runner/src/desktop/host_clock.c)
+    target_include_directories(sm_video_test PRIVATE src ${RECOMP_UI_ROOT}/src
+        ${SNESRECOMP_ROOT}/runner/src/desktop)
     add_test(NAME sm_custom_video
         COMMAND sm_video_test ${CMAKE_CURRENT_BINARY_DIR}/sm-video-test.ini)
 
@@ -107,8 +109,10 @@ if(BUILD_TESTING AND NOT ANDROID)
     add_executable(sm_mode7_test tests/sm_mode7_test.c src/sm_mode7.c)
     target_include_directories(sm_mode7_test PRIVATE src)
     add_test(NAME sm_custom_mode7 COMMAND sm_mode7_test)
-    add_executable(sm_render_capture tools/sm_render_capture.c src/sm_renderer.c src/sm_video.c src/sm_mode7.c)
-    target_include_directories(sm_render_capture PRIVATE src ${SNESRECOMP_ROOT}/runner/src)
+    add_executable(sm_render_capture tools/sm_render_capture.c src/sm_renderer.c src/sm_video.c src/sm_mode7.c
+        ${SNESRECOMP_ROOT}/runner/src/desktop/host_clock.c)
+    target_include_directories(sm_render_capture PRIVATE src ${SNESRECOMP_ROOT}/runner/src
+        ${SNESRECOMP_ROOT}/runner/src/desktop)
     # Assertions are the test oracle, including Release configurations.
     foreach(sm_test sm_video_test sm_renderer_test)
         if(MSVC)
@@ -125,9 +129,6 @@ if(BUILD_TESTING AND NOT ANDROID)
     endif()
 endif()
 
-# The desktop GL presenter (and its OpenGL::GL link) arrives with
-# snesrecomp_target_opengl() below. On Android rendering goes through
-# SDL_Renderer on GLES and none of it is compiled.
 # Generated recompiler output (produced by tools/regen.sh; not committed).
 #
 # SM_GEN_DIR is overridable so a build can be pointed at generated C emitted by
@@ -156,7 +157,7 @@ endif()
 set(SM_HOST_SOURCES
     ${SNESRECOMP_RUNNER_SOURCES}
     # game-specific runtime
-    src/main.c            # host: SM presentation, pacing, scripted input
+    src/main.c            # host shim: identity + this title's hooks
     src/sm_rtl.c          # THE PORT: single-fiber frame model, NMI/IRQ, HDMA
     src/gen_stubs.c       # hand-written bodies for hle_func/hle_dispatch
     src/sm_cpu_infra.c    # RtlGameInfo registration
@@ -201,12 +202,15 @@ endif()
 
 # ── Shared host services, from the framework instead of a private fork ──────
 #
-# config.ini + [KeyMap]. This is also what gives the in-game overlays their
-# hotkeys: the framework's Config carries kKeys_SaveStateMenu and kKeys_Rewind,
-# which this port's forked copy of config.h predated and therefore could never
-# bind — the save-state browser and rewind filmstrip were linked into every
-# build and unreachable.
-snesrecomp_target_mmx_config(SuperMetroidSNESRecomp)
+# The desktop host itself: launcher flow, ROM resolution, config.ini +
+# [KeyMap] (which is what gives the in-game overlays their hotkeys), the
+# window and the SDL/GL presenters, audio, gamepads, the save-state browser
+# and rewind filmstrip, the pacing clock, crash handlers and the post-mortem
+# report (TIER2 adds the interpreter-gap manifest, which this port reads after
+# every run). src/main.c is the shim that names this title and supplies its
+# hooks. Before 2026-09 all of it was a 2,800-line private copy of the host in
+# src/main.c, ahead of the framework's in places and behind it in others.
+snesrecomp_target_desktop_host(SuperMetroidSNESRecomp TIER2)
 
 # ROM identity. rom_identity.txt is the one place the digests live: this turns
 # it into snesrecomp_rom_identity.h for src/main.c, and tools/regen.sh,
@@ -217,21 +221,10 @@ snesrecomp_target_mmx_config(SuperMetroidSNESRecomp)
 # of truth. A revision bump is one edit now.
 snesrecomp_rom_identity(SuperMetroidSNESRecomp ${CMAKE_CURRENT_SOURCE_DIR}/rom_identity.txt)
 
-# Crash/exit report. TIER2 adds the interpreter-gap manifest, which this port
-# reads after every run. The "sm" section is registered from src/sm_post_mortem.c
-# through the framework's game-section hook.
-snesrecomp_target_post_mortem(SuperMetroidSNESRecomp TIER2)
-
 # Win32 Fiber API on ucontext (desktop) / pthreads (Android) — sm_rtl.c's
 # single-fiber frame model runs on it. The Android backend in the framework
 # copy came from this port.
 snesrecomp_target_fiber_compat(SuperMetroidSNESRecomp)
-
-if(NOT ANDROID)
-    # Desktop GL presenter + GLSL preset renderer + GL loader. Android renders
-    # through SDL_Renderer on GLES and compiles none of it.
-    snesrecomp_target_opengl(SuperMetroidSNESRecomp)
-endif()
 
 # Release version stamp: configure with -DSNESRECOMP_BUILD_VERSION=<ver>
 # (the CMake equivalent of the MSVC games' /p:SnesRecompBuildVersion); it
@@ -271,8 +264,9 @@ else()
     )
 endif()
 
-# The post-mortem's Win32 DbgHelp link (StackWalk64, SymFromAddr) comes with
-# snesrecomp_target_post_mortem() above, which knows it needs it.
+# The post-mortem's Win32 DbgHelp link (StackWalk64, SymFromAddr) and the GL
+# presenter's OpenGL::GL link both come with snesrecomp_target_desktop_host()
+# above, which knows it needs them.
 
 # Dear ImGui pre-boot launcher (GUI) from the shared recomp-ui repo. One call
 # wires sources/includes/RECOMP_LAUNCHER define/CXX/asset-staging (same SM
@@ -283,3 +277,13 @@ endif()
 recomp_target_launcher_ui(SuperMetroidSNESRecomp
     CONSOLE snes
     BOXART ${CMAKE_CURRENT_SOURCE_DIR}/recomp/launcher/boxart.tga)
+
+# Generate & rebuild from inside the launcher: pick ROM -> recompile locally
+# -> cmake --build -> relaunch. The implementation is the framework's and the
+# host wires it (snesrecomp_codegen_host_autowire); this project contributes
+# no configuration.
+target_sources(SuperMetroidSNESRecomp PRIVATE
+    ${SNESRECOMP_ROOT}/host/snesrecomp_codegen_host.c)
+target_include_directories(SuperMetroidSNESRecomp PRIVATE
+    ${SNESRECOMP_ROOT}/host
+    ${RECOMP_UI_ROOT}/src)

@@ -112,6 +112,7 @@ gaps. Full regeneration remains mandatory after changing generation inputs.
 - Differential oracle: `snesrecomp/tools/snesref` (headless snes9x libretro, per-frame WRAM trace via `SNESREF_FRAMES`/`SNESREF_TRACE_FILE`); recomp side traces via `SNESRECOMP_WRAM_TRACE_FILE`. Whole-WRAM traces don't align frame-for-frame — diff a single semantic variable's timeline instead (e.g. game_state `$0998`).
 - The `EnableSnes9xOracle` runtime option only makes sense from boot (it can't follow save-state loads); see the warning in `config.ini`.
 - Env-gated probes: `SNESRECOMP_SBOUND=lo-hi` (S/DB at every block in a PC range), `SNESRECOMP_IBRWATCH=lo-hi` (interp-bridge per-step trace).
+- Headless repro: `SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy SNESRECOMP_RUN_FRAMES=N ./build/SuperMetroidSNESRecomp --script <file> "<absolute rom path>"`. The host anchors cwd to the executable's directory, so the ROM path must be absolute; `saves/`, `config.ini` and the report land beside the binary.
 
 `DEVELOPMENT.md` is the durable in-repo dev log (root-cause writeups, current blockers, open items) — read it for the current state of bring-up work and append milestone writeups there.
 
