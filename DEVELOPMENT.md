@@ -332,6 +332,309 @@ loop. Samus drawn every frame (6195 probe samples), process healthy. **UNCOMMITT
 Caveat: `stack_balance` in `last_run_report.json` counts the frame pop (balanced
 JSR=+2, JSL=+3) — not a true-leak signal; use the S-boundary probe.
 
+## Milestone (2026-09-11): Start at title -> file select crash FIXED (scheduler-frame watermark)
+
+### Symptom
+Pressing Start on the title screen: `[interp_cap] entry=$809589 last=$808573`
+(NMI handler spinning in `InvalidInterrupt_Crash $80:8573`), then
+`entry=$5C0080` garbage PCs, `sp=$0002/$FFF7/...`, `Warning! DMA from addr
+0x950795`, `[sm_rtl] LLE loop bailed`. All downstream.
+
+### Root cause (measured)
+Headless repro (`SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy --script`, Start
+for 8 frames at frame ~600 = title) with `SNESRECOMP_INTERP_TRACE=1`:
+`[interp_bridge] yield-mode NLR exit (non-unwind) _air=1 target=$8091A9
+frame=633 site=$818DED sp_pre=$1FF0 sp=$1FF6 s_enter=$1FEC`.
+Game state 1 -> 4 (FileSelectMenus). `FileSelectMenu_0_FadeOutConfigGfx`
+($81:944E) calls `WaitUntilEndOfVblankAndClearHdma` -> (JSR) `WaitForNMI`;
+the whole-program LLE frame resumes INSIDE that WaitForNMI at S=$1FEC, so
+`s_exit`/`s_interp_owner_exit_s` = $1FEC. WaitForNMI returns, and
+`LoadInitialMenuTiles` ($81:8DDB, interpreted, M1X1 after `SEP #$30`) does
+`JSL SetupDmaTransfer` ($80:91A9) at S=$1FF0. SetupDmaTransfer is compiled for
+M1 and rewrites its return address (+8 inline parameter bytes); its RTL took
+`interp_tier_dispatch_rewritten_return`, whose `crossed_into_compiled_ancestor`
+saw post-return S ($1FF0..) above the owner watermark ($1FEC) and concluded the
+rewrite belonged to a compiled ancestor. It ran the continuation in a NESTED
+tier frame and returned SKIP_1; the yield-mode bounce site then took the
+"non-unwind NLR" exit, reported the frame as complete, and the next host frame
+injected NMI at the stale resume PC over a half-unwound stack -> garbage ->
+BRK/COP -> `$80:8573`.
+
+The watermark is meaningless for a scheduler/whole-program frame: it entered at
+whatever S the previous frame yielded from, and its program legitimately runs
+above that S every frame (the RTS watermark was already disabled for
+`yield_pc` mode for the same reason; the three owner-crossing checks were not).
+
+### Fix (class, runtime-only, NO regen) — `snesrecomp/runner/src/snes/interp_bridge.c`
+- `s_interp_owner_is_scheduler` recorded per bridge frame (`yield_pc != 0`);
+  `interp_owner_crossed(post_s)` is the single predicate, false for scheduler
+  owners. Used by `interp_tier_dispatch_rewritten_return`,
+  `interp_bridge_return_targets_owner`, and the bounce-site `_skip_crossed_owner`.
+- A scheduler frame that still receives an unconsumable SKIP_N now bails
+  contained (`return 0`) instead of reporting a completed frame; `sm_rtl.c`
+  honours `g_game_done` in the LLE path so a bail stays stopped (it used to
+  re-run frames from the stale PC every frame, executing garbage).
+- Diagnostics kept: the low-exec tripwire dumps the always-on 8192-step ring
+  (the 64-entry local window was all `$FF` padding); the yield-mode NLR log now
+  carries frame/site/sp/s_enter.
+- Regression test `S8d` in `tests/interp816/bridge_test.c` (harness now models
+  `g_recomp_stack_top` like the real `RecompStackPush`, without which the
+  crossing branch was untestable). Fails without the fix (aot_called=124),
+  passes with it: 104/104.
+- `src/post_mortem.c`: creates `build/` and reports a failed report write —
+  `build-release/` had no `build/` subdir, so the "always-on" post-mortem had
+  been silently writing nothing.
+
+### Verified (instrument state; on-screen verdict pending Alex)
+Headless 1250-frame run, Start at 602/810/1010: game_state 1 -> 4 (632) -> 2
+(890) -> $1E (1020), zero caps / low-exec / NLR / bails / DMA warnings.
+WRAM low-8K trace pre- vs post-fix identical through frame 632 except stack
+bytes and one 2-frame-cadence counter ($064B) that pre-fix stepped a frame
+early (pre-fix also spent a 2M-step cap in frame 0: boot now 0.6 s vs 2.7 s).
+Not verified: pixels (no headless capture path; earlier windowed runs stole
+focus and ate keystrokes — use the dummy SDL drivers for repro runs).
+Framework v2 suite 399/402 (3 pre-existing `test_emit_function_smoke`
+failures, emitter-side, untouched). **UNCOMMITTED.**
+
+## 2026-09-12 — the host is the framework's; main.c is a shim
+
+`src/main.c` (2,849 lines: launcher flow, ROM resolution, config, window,
+SDL/GL presenters, audio, gamepads, overlays, pacing clock, crash pipeline,
+scripted input) moved up into snesrecomp as `runner/src/desktop/host_main.c`
+(+ `host_clock.c`, the former SmClock with the rate as a parameter), linked
+by `snesrecomp_target_desktop_host(<target> [TIER2])`. main.c is now 250
+lines: a `SnesDesktopHostGame` descriptor with identity from
+`snesrecomp_rom_identity.h` and SM's hooks (custom renderer via
+prepare_frame/draw_frame, presentation rate, door-transition pacing debt,
+SPC player, Mods provider, SM_AUDIO_PROBE). The new-project templates
+(`main.c.in`, `host_contract.c.in`, `CMakeLists.txt.in`) produce the same
+shape, so the second on-disk scaffold (`SuperMetroidSNESRecomp`) rendered
+file select, options and the intro on the first build against this host —
+it had presented a black frame before because the working host lived only
+here.
+
+Verified: guest WRAM trace byte-identical to the pre-change binary over a
+1,900-frame scripted boot to game_state 8 (`multi.txt`, dummy drivers);
+identical again with the save-state browser opened, saved, loaded and closed
+at frame 700 (SNESRECOMP_OVERLAY_SELFTEST) — panel dumped at 512x448;
+screenshots at frames 700/1300 identical pixel counts between this repo and
+the scaffold; windowed SDL and OpenGL presenters both initialize and present
+(x11); ctest 8/8, framework v2 401/404 (the 3 pre-existing
+`test_emit_function_smoke` failures), new `test_host_clock` registered.
+Headless screenshots: `SNESRECOMP_SCREENSHOT=<ppm> SNESRECOMP_SCREENSHOT_FRAME=<n>`.
+
+## 2026-09-12 — overlays with a controller: "the save-state menu freezes the game"
+
+Report (DualSense, both repos): the browser opened by Select+R and then
+nothing happened; rewind never opened. Causes, both in the host (now
+framework-owned, so one fix): (1) the overlay modal pumps handled quit and
+keyboard events only, so the pad's d-pad/B/shoulders never reached the panel
+-- a keyboard player never saw it and the word-injecting self-test enters
+below the event layer, so it never saw it either; (2) nothing bound rewind:
+the framework left SaveStateMenu/Rewind unbound (F7/F8 collide with LoadState
+slots), this repo's config.ini did not bind them, and the host had no pad
+gesture. Fixes: one HandleDeviceEvent for the main loop and both pumps;
+`[Controller] RewindGesture` (Select+R3 default) parsed by the host; default
+keys F11/F12 in the framework config; pad-bound system commands dropped while
+a panel is up; buttons held when a panel closes masked until released (the
+closing B leaked a jump). Test: `SNESRECOMP_OVERLAY_SELFTEST_PAD=<frame>`
+attaches a virtual gamepad and drives both panels through SDL events; the
+first version of it passed vacuously (a real pad took player 1) and then
+pressed the SNES A instead of B -- both caught by the guest trace, which must
+be byte-identical with the test armed.
+
+## 2026-09-12 — a fresh scaffold did not boot: rendered from the wrong wizard
+
+Studio scaffolded Super Metroid again from scratch; it pinned snesrecomp main
+(host unit, shim templates) but its main.c/game_rtl.c/host_contract.c were
+the OLD templates: Studio ran the wizard from the sibling `~/GitHub/snesrecomp`
+checkout, which sits on a months-old branch, and rendered from that copy while
+the submodule came from the remote. The old game_rtl.c never delivers NMI, so
+game_state never left 0 (black frame; screenshot + WRAM trace). Fixes:
+snesrecomp bdcd4f5 (the wizard re-renders every template from the submodule
+it just pinned, takes the recomp-ui ref from there too, and a wizard older
+than the framework it pins fails with the token named); Studio 5077ed5 +
+ede4e80 (re-vendored wizard; new projects scaffold from the vendored copy
+unless SNESRECOMP_ROOT is set). Verified with a deliberately stale wizard copy
+(shim rendered, pinned main) and by re-rendering the on-disk scaffold from its
+pinned framework: boots to file select at frame 700.
+
+## 2026-09-12 — one frame of full-screen garbage: HDMA ran twice per HBlank
+
+`~/Videos/flicker.mp4`, 9.8 s of the Ceres intro: at 8.15 s a single frame
+replaces the whole play field with a repeating pink tile pattern while the HUD
+stays intact. Everything else in the clip is clean — the background aligns to a
+pure scroll between consecutive frames, the play area geometry never moves, and
+mean luma is flat apart from that one frame (68.9 against neighbours at 31.6).
+
+### What the picture was
+
+The Ceres shaft is drawn in **mode 7 below a mode-1 HUD**, the switch being
+HDMA channel 3 writing `$2105` at scanline 31. On the bad frame that write
+never took, so mode-7 VRAM — interleaved tile and map bytes — was rendered as a
+mode-1 tilemap. That is the pink pattern.
+
+### Root cause (framework)
+
+Two HDMA engines were running. This port's `SmDrawPpuFrame` walks the real HDMA
+tables per line (`SimpleHdma_*`), and the framework's beam ALSO ran
+`dma_doHdma` from `snes_advance_beam`. The framework has a gate for exactly
+this (`snes_set_hdma_beam_enabled`, snes.h documents it), but the gated call was
+added *beside* the ungated one it was meant to replace (snesrecomp fd173d2,
+2026-08-28) instead of replacing it, so the gate gated nothing and, with the
+beam owning HDMA, every table was consumed **twice per HBlank**.
+
+The second pass re-ran channel 3's table from the frame's first entry (mode
+`$09`) while this host's raster loop had already advanced to the second (mode
+`$07`). It fires from inside guest register writes — `STY $4209` in the IRQ
+vector syncs the master clock, the beam advances, and the beam runs HDMA — so
+it lands only when that write happens to cross an HBlank: about one frame in
+eighty. A host backtrace at a trapped `$2105` write named the whole chain:
+`bank_80_9870_M0X0 → cpu_write16 → WriteRegWord → WriteReg →
+snes_sync_master_clock → snes_advance_beam → dma_doHdma → ppu_write`.
+
+### Fix
+
+- snesrecomp: delete the two ungated pre-gate calls in `snes_advance_beam`
+  (`dma_doHdma` per HBlank and `dma_initHdma` at field wrap) so the gate works
+  and beam HDMA runs once. Regression test in `tests/dma/hdma_timing_test.c`:
+  two single-line entries writing different values to one register must leave
+  the FIRST after one HBlank, and `hdmaBeamOff` must leave the register
+  untouched. It fails on the pre-fix engine and passes after.
+- `src/sm_rtl.c`: `snes_set_hdma_beam_enabled(g_snes, false)` at the top of
+  `SmDrawPpuFrame` — this loop is the frame's HDMA engine. Set every frame,
+  not once at boot: a save-state load restores the `Snes` struct it lives in.
+- snesrecomp: `SimpleHdma_Init` now infers that declaration, because calling
+  it IS the declaration. Eight ports drive HDMA from their own raster loop
+  (`MegaManX`, `MetalWarriors`, `StarFox`, `SuperMarioWorld`, `SuperSmashWorld`,
+  `ZeldaAlttP`, the `SuperMetroidSNESRecomp` scaffold and this one) and none of
+  them had said so, so all eight had the same exposure. The explicit call above
+  is kept as documentation; removing it renders identically.
+
+### Verified
+
+Reproduced headlessly and deterministically (`fuzz0` script, frame 2198): the
+present dump shows the garbage frame between two clean ones, luma 113.1 against
+52.7/52.5. After the fix that frame's CRC equals its successor's and every
+other frame in the range is byte-identical, so the change touches the corrupt
+frame and nothing else. Across ~70k scripted frames the class is gone; the
+anomalies that remain are `hdmaen=00` frames where the guest itself changes
+BGMODE for one frame during a door transition.
+
+### Tooling added
+
+- Framework: `SNESRECOMP_SCREENSHOT_DIR` (+ `_FROM`/`_TO`) dumps every
+  **present** as `present_NNNNNN.ppm` with a `presents.csv` of present, frame,
+  interpolation weight, CRC32 and mean luma; `SNESRECOMP_PRESENT_LOG` writes
+  the CSV alone, so a long session can be scanned for the one present that is
+  wrong before dumping any pictures. A flicker is a claim about the relation
+  between consecutive presents, and a per-simulated-frame dump hides exactly
+  the pair that differs.
+- `SM_RASTER_PROBE=<path>`: the shape of each rendered frame (IRQ schedule,
+  TM/BG3SC left behind, HDMA mask armed, per-line BG-mode run-length), written
+  on change plus a line for any frame differing from BOTH neighbours.
+- `tools/snesref` now builds and runs on Linux (dlopen instead of
+  LoadLibrary), so the oracle's frame dumps are available beside the recomp's.
+
+## 2026-09-12 — run-ahead: the picture now comes from the speculation
+
+Asked to check whether run-ahead did anything, it did not. Over 1,195 frames
+the presented picture with `RunAhead = 1` was byte-identical to the picture
+with it off, on the same frame; a working run-ahead shows the frame AFTER.
+Meanwhile it cost 0.7 ms and a 324 KB snapshot save+load per frame, and left
+guest state changed on 21 frames in 1,200.
+
+### Three defects, in order of discovery
+
+1. **The picture was redrawn after the rewind.** `snes_runahead_run_frame`
+   speculated and rewound inside the guest step, but this host draws
+   afterwards, in `draw_ppu_frame` from whatever state the guest is then in --
+   the rewound state. The speculative rendering was thrown away. Proof at the
+   time: raster time per frame was unchanged with the feature on (2.663 vs
+   2.666 ms), so the picture was rasterised exactly once, after the rewind.
+   Run-ahead now takes a capture callback from the host and calls it on the
+   last speculative frame, before rewinding.
+
+2. **The real frame lost its raster side effects.** Moving the capture into
+   the speculation was not enough: this port's raster pass RUNS GUEST CODE --
+   the HUD/room split dispatches the game's own raster IRQ handlers, which
+   write WRAM, and during a door transition move the camera and Samus. With
+   only the speculative pass running, the rewind took those writes away with
+   the speculation. The callback now runs twice: once on the real frame for
+   its side effects (picture discarded, before the snapshot so the writes are
+   inside it), once on the speculated frame for the picture.
+
+3. **The SPC700 was never rewound.** `Apu.portClock` and the port anchors sit
+   deliberately AFTER the region `apu_saveload` serialises -- host-side lead,
+   not machine state -- so a rollback does not put them back. Every
+   speculative frame therefore advanced the audio chip permanently: measured,
+   the SPC had executed 73% more cycles after 232 frames, and the game's
+   sound-effect queue stepped a frame early. Fixed upstream by not driving the
+   APU on a speculative frame at all (`rtl_sync_apu_frame_boundary` is gated
+   on `!g_rtl_speculative_frame`), which is both correct -- that audio is
+   discarded regardless -- and cheaper.
+
+### And the execution position, which had to move too
+
+A guest snapshot holds the machine, not where the game is in its own code.
+This port has two execution models and neither was in a rollback: the LLE
+bridge resume PC (`g_lle_resume_pc`, a static here) and, in the recompiled
+modes, the whole C call chain on the game fiber. New `RtlGameInfo.exec_state_*`
+hooks carry both in the rollback blob (in-process, in-memory, this build only
+-- never a file); `FiberSnapshotSave/Load` in the framework's fiber_compat
+copies a suspended ucontext fiber's live stack and context back to the same
+addresses, so every interior pointer stays valid. Win32 fibers are opaque and
+an Android fiber is a real thread: both report unsupported and run-ahead
+declines there rather than rewinding the machine out from under a fiber that
+stays put. `sm_spc_player`'s ports and APU RAM image ride along, being host
+state the guest talks to.
+
+### Verified
+
+Over a 1,200-frame script, with `RunAhead = 1`: the presented picture equals
+the no-run-ahead run's NEXT frame on 1,196 of 1,198 comparable frames (the
+last frames have no successor), and the per-frame guest state -- WRAM CRC plus
+the CPU register file -- is IDENTICAL on all 1,200. Same at 2 and 4 frames of
+look-ahead (N+2 on 1,196; N+4 on 1,187), and in the `on` and `force` execution
+modes, where the fiber snapshot is the one doing the work and its size tracks
+the guest's call depth. Cost, unpaced: 3.67 ms/frame to 5.73 ms/frame, wall
+clock 5.63 s to 8.44 s for 1,200 frames. That is the honest price of one frame
+of look-ahead -- two guest frames, two raster passes and a ~1.1 MB snapshot
+per displayed frame -- against a 16.6 ms budget.
+
+`snesrecomp/tests/host/fiber_snapshot_test.c` covers the fiber half: a fiber
+suspended several frames deep in a recursion is snapshotted, run forward,
+restored, and must carry on from the restored point.
+
+## 2026-09-12 — "Warning! DMA from addr 0x9a0000" is the game, wrapping a bank
+
+Printed on every run, and benign. At frame 1020 Super Metroid programs a 16 KB
+VRAM upload from `$9A:D200` through `SetupDmaTransfer` ($80:91A9), from a
+record that is literal ROM data at `$82:8319` (`01 18 00 D2 9A 00 40`). Bank
+`$9A` has 11,776 bytes left from that address, so the transfer wraps at the
+bank boundary and spends its last 4,608 bytes at `$9A:0000` -- which on this
+LoROM cartridge is the WRAM mirror. A DMA's A-bus address wraps within its
+bank and never carries into the next one, so hardware reads the same bytes,
+and the recompilation is faithful.
+
+The framework's check sat in the per-byte transfer loop, asking whether a
+`$80+` bank was being read below `$8000` -- exactly what an authentic wrap
+looks like partway through, which is why the reported size (4,608) was the
+remainder rather than the programmed 16 KB. Fixed upstream by asking once,
+where the channel is armed, from the address the game programmed.
+
+Two things this cost while it stood: the report was on stdout while the host's
+breadcrumbs are on stderr, so in a merged log it appeared beside "first frame
+simulated" for something that happened at frame 1020; and it set `g_fail`,
+the latch that also gates the off-rails ROM-pointer report, so one false
+positive silenced a real diagnostic for the rest of the session.
+
+Found alongside a regression of mine in the same log: run-ahead's rollback was
+reading as a timeline jump, so the host tore down and rebuilt its 17.5 MB
+rewind ring every frame (that is the repeated "[snes_rewind] 60 snapshots
+every 6 frames"). Rewind kept no history at all while run-ahead was on. Also
+fixed upstream, by carrying the state generation across a rollback.
+
 ## Open items
 
 1. **Next attract blocker** — the f2689 freeze is fixed and the demo now plays

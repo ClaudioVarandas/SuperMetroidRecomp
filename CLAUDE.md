@@ -61,9 +61,44 @@ Game-side ctest targets: `sm_display_geometry`, `ppu_widescreen_windows`, `sm_wi
 
 ### Single-fiber frame model (src/sm_rtl.c)
 
-Unlike MMX's multi-slot scheduler, Super Metroid runs as one linear program: reset falls into the main game loop (`$82:8948`), which calls `WaitForNMI` (`$80:8338`) from arbitrary call depth. The whole game therefore runs on ONE host fiber. `WaitForNMI` is HLE-replaced (`bank00.cfg` → body in `src/gen_stubs.c`) with a yield to the host; the host emulates the frame (NMI + PPU), then resumes the fiber, preserving the full C call stack. Architectural register state is saved/restored around each fiber switch. `src/fiber_compat.c` shims Win32 Fibers onto ucontext for macOS/Linux, and onto pthread+condvar handoffs on Android (bionic has no makecontext/swapcontext).
+Unlike MMX's multi-slot scheduler, Super Metroid runs as one linear program: reset falls into the main game loop (`$82:8948`), which calls `WaitForNMI` (`$80:8338`) from arbitrary call depth. The whole game therefore runs on ONE host fiber. `WaitForNMI` is HLE-replaced (`bank00.cfg` → body in `src/gen_stubs.c`) with a yield to the host; the host emulates the frame (NMI + PPU), then resumes the fiber, preserving the full C call stack. Architectural register state is saved/restored around each fiber switch. The Win32 Fiber API is shimmed onto ucontext (macOS/Linux) and onto pthread+condvar handoffs on Android (bionic has no makecontext/swapcontext) by the framework's `desktop/fiber_compat.c`, wired in with `snesrecomp_target_fiber_compat()`. The Android backend originated here and was moved up in 2026-09.
 
-Other game-side runtime: `sm_cpu_infra.c` (game registration consumed by the runner), `sm_spc_player.c` (audio), `post_mortem.c` (crash reporting, see below), `main.c`, `sm_display.c`/`opengl.c`/`glsl_shader.c` (presentation).
+Other game-side runtime: `sm_cpu_infra.c` (game registration consumed by the runner), `sm_spc_player.c` (audio), `sm_post_mortem.c` (the `sm{}` crash-report section, registered through the framework hook), `main.c`, `sm_display.c`/`sm_video.c` (presentation geometry, aspect/HUD policy, the simulation/presentation clock).
+
+### What this port does NOT own
+
+Everything generic now comes from the framework through `snesrecomp_target_*`
+helpers in `CMakeLists.txt`, rather than from a private fork in `src/`:
+
+| Was (deleted 2026-09) | Now |
+|---|---|
+| `src/config.c`, `src/config.h` | `snesrecomp_target_mmx_config()` |
+| `src/post_mortem.c`, `.h` | `snesrecomp_target_post_mortem(TIER2)` |
+| `src/glsl_shader.c`, `.h` | via `snesrecomp_target_opengl()` |
+| `src/opengl.c`, `third_party/gl_core`, `third_party/stb` | `snesrecomp_target_opengl()` |
+| `src/fiber_compat.c`, `.h` | `snesrecomp_target_fiber_compat()` |
+| inline SHA-256/CRC32 in `main.c`, `src/codegen_setup.c` | `snesrecomp_rom_identity()` → `snesrecomp_rom_identity.h`, from `rom_identity.txt` |
+
+The forks were roughly 2,400 lines, some identical to the framework's and some
+ahead of it. What this port was ahead on was moved UP (the Android fiber
+backend, the post-mortem's DB tripwire and stack/dispatch/PPU-DMA dumps, the
+GL presenter itself) rather than deleted. **Do not re-fork these into `src/`**;
+fix them in `snesrecomp/` so every port inherits it.
+
+### In-game overlays
+
+The save-state slot browser (Select+R on the pad, or `[KeyMap] SaveStateMenu`,
+F11) and the rewind filmstrip (`[Controller] RewindGesture`, Select+R3 by
+default, or `[KeyMap] Rewind`, F12) are framework modules driven by the
+framework host. The guest is frozen while a panel is up; the host presents the
+last frame with the panel composited at 512x448 and never runs guest code from
+a modal loop. Two bugs this port shipped and that now have tests: the modal
+pumps dropped controller events, so a pad player saw a frozen game and a panel
+that ignored them (`SNESRECOMP_OVERLAY_SELFTEST_PAD=<frame>` drives both panels
+with a virtual gamepad through real SDL events); and the button that closes a
+panel leaked into the guest for a frame (held-at-close buttons are masked
+until released). A traced run with either self-test armed must match one
+without it.
 
 ### Widescreen
 
@@ -76,12 +111,14 @@ gaps. Full regeneration remains mandatory after changing generation inputs.
 ### Debugging workflow
 
 - `build/last_run_report.json` is the always-on post-mortem written on crash/exit: CPU state, recomp stack, abandons, tier2 coverage, dispatch-log ring, DB/PB ring, and an SM-specific `sm{}` section (game_state, enemy slots). It is the primary crash-diagnosis artifact — the TCP debug server is not usable for SM.
-- Differential oracle: `snesrecomp/tools/snesref` (headless snes9x libretro, per-frame WRAM trace via `SNESREF_FRAMES`/`SNESREF_TRACE_FILE`); recomp side traces via `SNESRECOMP_WRAM_TRACE_FILE`. Whole-WRAM traces don't align frame-for-frame — diff a single semantic variable's timeline instead (e.g. game_state `$0998`).
+- Differential oracle: `snesrecomp/tools/snesref` (headless snes9x libretro, per-frame WRAM trace via `SNESREF_FRAMES`/`SNESREF_TRACE_FILE`, frame dumps via `SNESREF_FRAME_DUMP_DIR`); build it with `tools/snesref/build.sh` on Linux and point it at any libretro SNES core. Recomp side traces via `SNESRECOMP_WRAM_TRACE_FILE`. Whole-WRAM traces don't align frame-for-frame — diff a single semantic variable's timeline instead (e.g. game_state `$0998`).
 - The `EnableSnes9xOracle` runtime option only makes sense from boot (it can't follow save-state loads); see the warning in `config.ini`.
-- Env-gated probes: `SNESRECOMP_SBOUND=lo-hi` (S/DB at every block in a PC range), `SNESRECOMP_IBRWATCH=lo-hi` (interp-bridge per-step trace).
+- Env-gated probes: `SNESRECOMP_SBOUND=lo-hi` (S/DB at every block in a PC range), `SNESRECOMP_IBRWATCH=lo-hi` (interp-bridge per-step trace), `SM_RASTER_PROBE=<path>` (the shape of each rendered frame: the HUD/room IRQ split's schedule, the layers and BG3 tilemap it left enabled, the HDMA mask armed, and the per-line BG mode; written on change plus any frame differing from BOTH neighbours).
+- One-frame glitches: `SNESRECOMP_PRESENT_LOG=<csv>` logs every PRESENT (present, frame, interpolation weight, CRC32, mean luma) so a session can be scanned for the one present that is wrong; `SNESRECOMP_SCREENSHOT_DIR=<dir>` with `_FROM`/`_TO` then dumps that range as `present_NNNNNN.ppm`. Per present, not per simulated frame: with the enhanced renderer the host presents at the display rate and can show one simulated frame twice with different weights.
+- Headless repro: `SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy SNESRECOMP_RUN_FRAMES=N ./build/SuperMetroidSNESRecomp --script <file> "<absolute rom path>"`. The host anchors cwd to the executable's directory, so the ROM path must be absolute; `saves/`, `config.ini` and the report land beside the binary.
 
 `DEVELOPMENT.md` is the durable in-repo dev log (root-cause writeups, current blockers, open items) — read it for the current state of bring-up work and append milestone writeups there.
 
 ## Configuration
 
-`config.ini` (tracked) holds runtime settings: hotkeys, gamepad maps, renderer/audio options. Per-developer overrides go in `config.local.ini` (gitignored), applied after `config.ini`.
+`config.ini` (tracked) holds this port's tuned defaults: hotkeys, gamepad maps, renderer/audio options. The host reads the copy **beside the executable** (`build-release/config.ini`), which the build seeds from the tracked file once (`snesrecomp_target_config_seed`) and which is the player's afterwards: the launcher and the host write settings back into it. A change to the tracked file therefore reaches an existing build tree only by deleting that copy, or through the framework's key migrations (a former generated default is rewritten to the current one, once, with a breadcrumb). Per-developer overrides go in `config.local.ini` (gitignored), applied after `config.ini`. `SNESRECOMP_KEYMAP_DUMP=1` prints what the system hotkeys resolved to.

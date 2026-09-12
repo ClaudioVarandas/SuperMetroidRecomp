@@ -1,5 +1,6 @@
 #include "sm_rtl.h"
 #include "sm_renderer.h"
+#include "sm_spc_player.h"
 #include "variables.h"
 #include "common_cpu_infra.h"
 #include "snes/snes.h"
@@ -112,6 +113,105 @@ void sm_host_yield(void) {
   sm_restore_cpu(&g_cpu, &g_game_saved);
 }
 
+/* ── Rewindable execution position (rollback snapshots) ──────────────────
+ *
+ * This port's guest is one linear program on ONE host fiber: WaitForNMI
+ * yields from arbitrary call depth, so the game's position in its own code IS
+ * that fiber's C call chain, and no guest snapshot contains it. Rewinding the
+ * machine without it leaves the two out of step -- measured before these
+ * hooks existed, run-ahead's rewind left 21 frames in 1,200 in a state the
+ * game would not otherwise have been in, in bursts around scene changes where
+ * the call depth differs from frame to frame.
+ *
+ * So a rollback snapshot carries the fiber's live stack and context, plus the
+ * register file sm_host_yield parked beside it. In-process, in-memory, this
+ * build only -- exactly the promise RtlRollbackSaveToMemory makes. File
+ * savestates do NOT use these: a stack image is not a thing to write to disk.
+ */
+typedef struct SmExecHeader {
+  uint32_t   magic;
+  uint32_t   version;
+  SmCpuSave  game_saved;
+  uint8_t    game_started;
+  uint8_t    game_done;
+  uint8_t    pad[2];
+  uint32_t   lle_resume_pc;
+  uint32_t   fiber_bytes;
+  uint32_t   spc_bytes;
+} SmExecHeader;
+
+#define SM_EXEC_MAGIC   0x534D4558u  /* 'SMEX' */
+#define SM_EXEC_VERSION 1u
+
+size_t SmExecStateBound(void) {
+  /* No fiber: this frame ran on the interpreter bridge, whose own position is
+   * already in the rollback residue. All that is left is the small header --
+   * and g_lle_resume_pc in it is the thing that actually bit, because it is
+   * where the bridge resumes next frame and speculation moves it. */
+  if (!g_game_fiber) return sizeof(SmExecHeader) + SmSpcPlayer_StateSize();
+  /* A fiber exists, so the call chain in it IS the guest's position. If this
+   * backend cannot copy one, say so with a zero bound rather than let a
+   * rewind put the machine back and leave the fiber where it was. */
+  if (!FiberSnapshotSupported()) return 0;
+  {
+    size_t fiber = FiberSnapshotBound(g_game_fiber);
+    /* A fiber that exists but has never been suspended has nothing live to
+     * copy; the header alone is the whole position. */
+    return sizeof(SmExecHeader) + fiber + SmSpcPlayer_StateSize();
+  }
+}
+
+size_t SmExecStateSave(void *out, size_t capacity) {
+  SmExecHeader hdr;
+  size_t fiber = 0;
+  if (!out || capacity < sizeof(hdr)) return 0;
+  if (g_game_fiber) {
+    if (!FiberSnapshotSupported()) return 0;
+    fiber = FiberSnapshotSave(g_game_fiber, (uint8_t *)out + sizeof(hdr),
+                              capacity - sizeof(hdr));
+    if (!fiber && FiberSnapshotBound(g_game_fiber)) return 0;  /* had one, lost it */
+  }
+  hdr.magic         = SM_EXEC_MAGIC;
+  hdr.version       = SM_EXEC_VERSION;
+  hdr.game_saved    = g_game_saved;
+  hdr.game_started  = g_game_started ? 1u : 0u;
+  hdr.game_done     = g_game_done ? 1u : 0u;
+  hdr.pad[0] = hdr.pad[1] = 0;
+  {
+    size_t spc = SmSpcPlayer_SaveState((uint8_t *)out + sizeof(hdr) + fiber,
+                                       capacity - sizeof(hdr) - fiber);
+    if (SmSpcPlayer_StateSize() && !spc) return 0;
+    hdr.spc_bytes = (uint32_t)spc;
+    hdr.lle_resume_pc = g_lle_resume_pc;
+    hdr.fiber_bytes   = (uint32_t)fiber;
+    memcpy(out, &hdr, sizeof(hdr));
+    return sizeof(hdr) + fiber + spc;
+  }
+}
+
+int SmExecStateLoad(const void *in, size_t size) {
+  SmExecHeader hdr;
+  if (!in || size < sizeof(hdr)) return 0;
+  memcpy(&hdr, in, sizeof(hdr));
+  if (hdr.magic != SM_EXEC_MAGIC || hdr.version != SM_EXEC_VERSION) return 0;
+  if (size < sizeof(hdr) + hdr.fiber_bytes + hdr.spc_bytes) return 0;
+  if (hdr.spc_bytes &&
+      !SmSpcPlayer_LoadState((const uint8_t *)in + sizeof(hdr) + hdr.fiber_bytes,
+                             hdr.spc_bytes))
+    return 0;
+  if (hdr.fiber_bytes) {
+    if (!g_game_fiber) return 0;
+    if (!FiberSnapshotLoad(g_game_fiber, (const uint8_t *)in + sizeof(hdr),
+                           hdr.fiber_bytes))
+      return 0;
+  }
+  g_game_saved    = hdr.game_saved;
+  g_game_started  = hdr.game_started != 0;
+  g_game_done     = hdr.game_done != 0;
+  g_lle_resume_pc = hdr.lle_resume_pc;
+  return 1;
+}
+
 void RunOneFrameOfGame(void) {
   if (sm_execution_mode() == SNESRECOMP_EXECUTION_MODE_LLE) {
     /* These door-loader routines wait for NMI from inside their bodies.
@@ -139,6 +239,12 @@ void RunOneFrameOfGame(void) {
      * later frame injects NMI and resumes at that exact guest PC.  The guest
      * stack retains arbitrary-depth coroutine continuations, while compiled
      * bodies bounce through the paired ABI without a host fiber. */
+    /* A contained bridge bail (see interp_bridge_run_loop returning 0) leaves
+     * the guest stack half-unwound; re-entering every frame from the stale
+     * resume PC executed garbage until it hit InvalidInterrupt_Crash and
+     * could reach save RAM on the way.  Stay stopped, like the fiber path. */
+    if (g_game_done)
+      return;
     uint32_t entry_pc = g_lle_resume_pc;
     if (!g_game_started) {
       cpu_state_init(&g_cpu, g_ram);
@@ -287,6 +393,14 @@ void SmDrawPpuFrame(void) {
     }
   }
 
+  /* This loop IS the HDMA engine for the frame: it walks the real tables per
+   * line below. The framework's own beam-timeline HDMA must therefore stay
+   * off, or every table is consumed twice -- once here and once from
+   * snes_advance_beam, which runs inside any guest register write that syncs
+   * the master clock. Set every frame rather than once at boot: a save-state
+   * load restores the Snes struct this flag lives in. */
+  snes_set_hdma_beam_enabled(g_snes, false);
+
   /* Reinitialize HDMA from the last $420C (HDMAEN) value written during
    * NMI. Super Metroid drives the HUD/status split and various color/
    * window effects through HDMA; the framework records the last HDMAEN
@@ -299,12 +413,45 @@ void SmDrawPpuFrame(void) {
    * Process every enabled hardware channel in priority order. */
   for (int ch = 0; ch < 8; ch++)
     SimpleHdma_Init(&hdma_chans[ch], &dma->channel[ch]);
+  unsigned probe_armed = 0;
+  for (int ch = 0; ch < 8; ch++)
+    if (hdma_chans[ch].table) probe_armed |= 1u << ch;
 
   /* Super Metroid programs the H/V IRQ for the HUD/minimap raster split
    * (Vector_IRQ at $80:986A dispatches IrqHandler_*_BeginHud/EndHud).
    * Latch the timer-IRQ at the programmed scanline so I_IRQ runs the
    * split mid-frame, matching MMX/SMW's draw path. */
   int trigger = g_snes->vIrqEnabled ? g_snes->vTimer : -1;
+
+  /* SM_RASTER_PROBE=<path>: the shape of each rendered frame -- the raster
+   * split's IRQ schedule, the layers and BG3 tilemap it left enabled, the
+   * HDMA mask it armed from, and the BG mode above and below the split.
+   * Written when the shape changes, plus a line for any frame whose shape
+   * differs from BOTH its neighbours.
+   *
+   * Why: the HUD and the room are two register sets separated by a mid-frame
+   * IRQ (IrqHandler_4_Main_BeginHudDraw sets TM=4 + BG3SC=0x5A at line 0,
+   * IrqHandler_6_Main_EndHudDraw restores the room's at line 31). A frame that
+   * keeps the HUD's set past line 31 draws the whole room from the HUD's
+   * tilemap: one frame of full-screen garbage under an intact HUD, which is
+   * what a player reports as a flicker. Nothing about it survives into the
+   * next frame, so only a per-frame record catches it. */
+  static int probe_checked;
+  static FILE *probe;
+  static char probe_last[256];
+  char probe_now[256];
+  int probe_len = 0;
+  int probe_mode_hud = -1, probe_mode_room = -1;
+  static uint8 probe_modes[225];
+  if (!probe_checked) {
+    const char *path = getenv("SM_RASTER_PROBE");
+    probe_checked = 1;
+    if (path) probe = fopen(path, "w");
+  }
+  if (probe)
+    probe_len = snprintf(probe_now, sizeof(probe_now), "vIrq=%d vTimer=%d hIrq=%d armed=%02x irqs=",
+                         g_snes->vIrqEnabled ? 1 : 0, g_snes->vTimer,
+                         g_snes->hIrqEnabled ? 1 : 0, probe_armed);
 
   for (int i = 0; i <= 224; i++) {
     /* HDMA runs during the H-blank preceding each visible scanline. The
@@ -319,9 +466,57 @@ void SmDrawPpuFrame(void) {
       cpu_push_interrupt_frame(&g_cpu);
       I_IRQ(&g_cpu);
       trigger = g_snes->vIrqEnabled ? g_snes->vTimer : -1;
+      if (probe && probe_len < (int)sizeof(probe_now) - 8)
+        probe_len += snprintf(probe_now + probe_len, sizeof(probe_now) - probe_len,
+                              "%d,", i);
     }
     if (g_sm_video.enhanced || g_sm_video.fps_enabled)
       SmRendererCaptureLine(g_ppu, i);
+    if (probe) {
+      if (i == 10) probe_mode_hud = g_ppu->bgmode;
+      if (i == 100) probe_mode_room = g_ppu->bgmode;
+      if (i < 225) probe_modes[i] = g_ppu->bgmode;
+    }
     ppu_runLine(g_ppu, i);
+  }
+  if (probe) {
+    /* The frame's whole raster shape in one line: which registers the HUD/room
+     * split left behind, the HDMA mask the presentation pass armed from, and
+     * the mode the room was drawn in. A flicker is a frame whose shape differs
+     * from BOTH its neighbours -- one frame out of an otherwise steady run --
+     * so the probe keeps a one-frame window and reports exactly those. */
+    if (probe_len < (int)sizeof(probe_now) - 64)
+      snprintf(probe_now + probe_len, sizeof(probe_now) - probe_len,
+               " tm=%02x irqh=%04x hdmaen=%02x mode=%02x/%02x bg3sc=%02x",
+               g_ppu->screenEnabled[0], *(const uint16 *)(g_ram + 0xAB),
+               g_snesrecomp_last_hdmaen, probe_mode_hud, probe_mode_room,
+               g_ppu->bgXsc[2]);
+    /* The BG mode the HDMA left on every line, run-length encoded: the
+     * Ceres shaft is mode 7 below the mode-1 HUD, switched by HDMA channel 3
+     * writing $2105, so the split shows up here as "0:09 32:07 ...". */
+    char modes[256];
+    int mlen = 0;
+    for (int i = 0; i <= 224 && mlen < (int)sizeof(modes) - 12; i++)
+      if (i == 0 || probe_modes[i] != probe_modes[i - 1])
+        mlen += snprintf(modes + mlen, sizeof(modes) - mlen, "%d:%02x ", i,
+                         probe_modes[i]);
+    static char probe_prev[256], probe_prev2[256];
+    static char modes_prev[256], modes_prev2[256];
+    static unsigned probe_prev_frame;
+    if (probe_prev[0] && strcmp(probe_prev2, probe_now) == 0 &&
+        strcmp(probe_prev, probe_now) != 0)
+      fprintf(probe, "%u ONE-FRAME ANOMALY %s\n    modes  %s\n"
+                     "    steady %s\n    modes  %s\n",
+              probe_prev_frame, probe_prev, modes_prev, probe_now, modes);
+    snprintf(probe_prev2, sizeof(probe_prev2), "%s", probe_prev);
+    snprintf(probe_prev, sizeof(probe_prev), "%s", probe_now);
+    snprintf(modes_prev2, sizeof(modes_prev2), "%s", modes_prev);
+    snprintf(modes_prev, sizeof(modes_prev), "%s", modes);
+    probe_prev_frame = trace_frame;
+    if (strcmp(probe_now, probe_last) != 0) {
+      fprintf(probe, "%u %s\n", trace_frame, probe_now);
+      fflush(probe);
+      snprintf(probe_last, sizeof(probe_last), "%s", probe_now);
+    }
   }
 }

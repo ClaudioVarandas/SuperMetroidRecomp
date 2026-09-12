@@ -12,4 +12,13 @@ void RunOneFrameOfGame(void);
  * HLE in gen_stubs.c). */
 void sm_host_yield(void);
 
+/* Rollback-only execution position: the game fiber's live stack and context
+ * plus the register file parked beside it. See the block comment in
+ * sm_rtl.c. Registered as RtlGameInfo.exec_state_*; 0/failure everywhere the
+ * fiber backend cannot snapshot (Windows fibers, Android threads), which is
+ * what makes run-ahead decline there instead of corrupting the timeline. */
+size_t SmExecStateBound(void);
+size_t SmExecStateSave(void *out, size_t capacity);
+int    SmExecStateLoad(const void *in, size_t size);
+
 #endif  /* SM_SM_RTL_H_ */

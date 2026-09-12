@@ -45,19 +45,6 @@ int SmHudAnchorX(SmViewport viewport, int x, int anchor);
 bool SmVideoLoad(SmVideoSettings *settings, const char *path);
 bool SmVideoSave(const SmVideoSettings *settings, const char *path);
 
-/* Monotonic time in seconds. Realtime play normally drops wall-time debt
- * after a slow guest frame. Door loading is the one exception: its guest
- * frames may repay debt while Samus has no control, keeping the SPC queue fed;
- * the host drops any remainder before gameplay resumes. */
-typedef struct SmClock {
-  double next_simulation, next_presentation, presentation_hz;
-  uint64_t simulation_frames, presentations, missed_presentations;
-} SmClock;
-void SmClockReset(SmClock *clock, double now, double presentation_hz);
-bool SmClockSimulationDue(const SmClock *clock, double now);
-void SmClockSimulationDone(SmClock *clock, double now, bool preserve_debt,
-                           double elapsed_periods);
-bool SmClockPresentationDue(const SmClock *clock, double now);
-void SmClockPresentationDone(SmClock *clock, double now);
-double SmClockAlpha(const SmClock *clock, double now);
-double SmClockNextDeadline(const SmClock *clock);
+/* The presentation clock itself is the framework's (snesrecomp
+ * runner/src/desktop/host_clock.h); it used to be SmClock here. These two
+ * validate the fps Mod option against the rates that clock supports. */
