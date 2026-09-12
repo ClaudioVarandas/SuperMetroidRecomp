@@ -293,6 +293,14 @@ void SmDrawPpuFrame(void) {
     }
   }
 
+  /* This loop IS the HDMA engine for the frame: it walks the real tables per
+   * line below. The framework's own beam-timeline HDMA must therefore stay
+   * off, or every table is consumed twice -- once here and once from
+   * snes_advance_beam, which runs inside any guest register write that syncs
+   * the master clock. Set every frame rather than once at boot: a save-state
+   * load restores the Snes struct this flag lives in. */
+  snes_set_hdma_beam_enabled(g_snes, false);
+
   /* Reinitialize HDMA from the last $420C (HDMAEN) value written during
    * NMI. Super Metroid drives the HUD/status split and various color/
    * window effects through HDMA; the framework records the last HDMAEN
@@ -305,12 +313,45 @@ void SmDrawPpuFrame(void) {
    * Process every enabled hardware channel in priority order. */
   for (int ch = 0; ch < 8; ch++)
     SimpleHdma_Init(&hdma_chans[ch], &dma->channel[ch]);
+  unsigned probe_armed = 0;
+  for (int ch = 0; ch < 8; ch++)
+    if (hdma_chans[ch].table) probe_armed |= 1u << ch;
 
   /* Super Metroid programs the H/V IRQ for the HUD/minimap raster split
    * (Vector_IRQ at $80:986A dispatches IrqHandler_*_BeginHud/EndHud).
    * Latch the timer-IRQ at the programmed scanline so I_IRQ runs the
    * split mid-frame, matching MMX/SMW's draw path. */
   int trigger = g_snes->vIrqEnabled ? g_snes->vTimer : -1;
+
+  /* SM_RASTER_PROBE=<path>: the shape of each rendered frame -- the raster
+   * split's IRQ schedule, the layers and BG3 tilemap it left enabled, the
+   * HDMA mask it armed from, and the BG mode above and below the split.
+   * Written when the shape changes, plus a line for any frame whose shape
+   * differs from BOTH its neighbours.
+   *
+   * Why: the HUD and the room are two register sets separated by a mid-frame
+   * IRQ (IrqHandler_4_Main_BeginHudDraw sets TM=4 + BG3SC=0x5A at line 0,
+   * IrqHandler_6_Main_EndHudDraw restores the room's at line 31). A frame that
+   * keeps the HUD's set past line 31 draws the whole room from the HUD's
+   * tilemap: one frame of full-screen garbage under an intact HUD, which is
+   * what a player reports as a flicker. Nothing about it survives into the
+   * next frame, so only a per-frame record catches it. */
+  static int probe_checked;
+  static FILE *probe;
+  static char probe_last[256];
+  char probe_now[256];
+  int probe_len = 0;
+  int probe_mode_hud = -1, probe_mode_room = -1;
+  static uint8 probe_modes[225];
+  if (!probe_checked) {
+    const char *path = getenv("SM_RASTER_PROBE");
+    probe_checked = 1;
+    if (path) probe = fopen(path, "w");
+  }
+  if (probe)
+    probe_len = snprintf(probe_now, sizeof(probe_now), "vIrq=%d vTimer=%d hIrq=%d armed=%02x irqs=",
+                         g_snes->vIrqEnabled ? 1 : 0, g_snes->vTimer,
+                         g_snes->hIrqEnabled ? 1 : 0, probe_armed);
 
   for (int i = 0; i <= 224; i++) {
     /* HDMA runs during the H-blank preceding each visible scanline. The
@@ -325,9 +366,57 @@ void SmDrawPpuFrame(void) {
       cpu_push_interrupt_frame(&g_cpu);
       I_IRQ(&g_cpu);
       trigger = g_snes->vIrqEnabled ? g_snes->vTimer : -1;
+      if (probe && probe_len < (int)sizeof(probe_now) - 8)
+        probe_len += snprintf(probe_now + probe_len, sizeof(probe_now) - probe_len,
+                              "%d,", i);
     }
     if (g_sm_video.enhanced || g_sm_video.fps_enabled)
       SmRendererCaptureLine(g_ppu, i);
+    if (probe) {
+      if (i == 10) probe_mode_hud = g_ppu->bgmode;
+      if (i == 100) probe_mode_room = g_ppu->bgmode;
+      if (i < 225) probe_modes[i] = g_ppu->bgmode;
+    }
     ppu_runLine(g_ppu, i);
+  }
+  if (probe) {
+    /* The frame's whole raster shape in one line: which registers the HUD/room
+     * split left behind, the HDMA mask the presentation pass armed from, and
+     * the mode the room was drawn in. A flicker is a frame whose shape differs
+     * from BOTH its neighbours -- one frame out of an otherwise steady run --
+     * so the probe keeps a one-frame window and reports exactly those. */
+    if (probe_len < (int)sizeof(probe_now) - 64)
+      snprintf(probe_now + probe_len, sizeof(probe_now) - probe_len,
+               " tm=%02x irqh=%04x hdmaen=%02x mode=%02x/%02x bg3sc=%02x",
+               g_ppu->screenEnabled[0], *(const uint16 *)(g_ram + 0xAB),
+               g_snesrecomp_last_hdmaen, probe_mode_hud, probe_mode_room,
+               g_ppu->bgXsc[2]);
+    /* The BG mode the HDMA left on every line, run-length encoded: the
+     * Ceres shaft is mode 7 below the mode-1 HUD, switched by HDMA channel 3
+     * writing $2105, so the split shows up here as "0:09 32:07 ...". */
+    char modes[256];
+    int mlen = 0;
+    for (int i = 0; i <= 224 && mlen < (int)sizeof(modes) - 12; i++)
+      if (i == 0 || probe_modes[i] != probe_modes[i - 1])
+        mlen += snprintf(modes + mlen, sizeof(modes) - mlen, "%d:%02x ", i,
+                         probe_modes[i]);
+    static char probe_prev[256], probe_prev2[256];
+    static char modes_prev[256], modes_prev2[256];
+    static unsigned probe_prev_frame;
+    if (probe_prev[0] && strcmp(probe_prev2, probe_now) == 0 &&
+        strcmp(probe_prev, probe_now) != 0)
+      fprintf(probe, "%u ONE-FRAME ANOMALY %s\n    modes  %s\n"
+                     "    steady %s\n    modes  %s\n",
+              probe_prev_frame, probe_prev, modes_prev, probe_now, modes);
+    snprintf(probe_prev2, sizeof(probe_prev2), "%s", probe_prev);
+    snprintf(probe_prev, sizeof(probe_prev), "%s", probe_now);
+    snprintf(modes_prev2, sizeof(modes_prev2), "%s", modes_prev);
+    snprintf(modes_prev, sizeof(modes_prev), "%s", modes);
+    probe_prev_frame = trace_frame;
+    if (strcmp(probe_now, probe_last) != 0) {
+      fprintf(probe, "%u %s\n", trace_frame, probe_now);
+      fflush(probe);
+      snprintf(probe_last, sizeof(probe_last), "%s", probe_now);
+    }
   }
 }

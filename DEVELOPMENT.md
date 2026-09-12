@@ -459,6 +459,77 @@ unless SNESRECOMP_ROOT is set). Verified with a deliberately stale wizard copy
 (shim rendered, pinned main) and by re-rendering the on-disk scaffold from its
 pinned framework: boots to file select at frame 700.
 
+## 2026-09-12 — one frame of full-screen garbage: HDMA ran twice per HBlank
+
+`~/Videos/flicker.mp4`, 9.8 s of the Ceres intro: at 8.15 s a single frame
+replaces the whole play field with a repeating pink tile pattern while the HUD
+stays intact. Everything else in the clip is clean — the background aligns to a
+pure scroll between consecutive frames, the play area geometry never moves, and
+mean luma is flat apart from that one frame (68.9 against neighbours at 31.6).
+
+### What the picture was
+
+The Ceres shaft is drawn in **mode 7 below a mode-1 HUD**, the switch being
+HDMA channel 3 writing `$2105` at scanline 31. On the bad frame that write
+never took, so mode-7 VRAM — interleaved tile and map bytes — was rendered as a
+mode-1 tilemap. That is the pink pattern.
+
+### Root cause (framework)
+
+Two HDMA engines were running. This port's `SmDrawPpuFrame` walks the real HDMA
+tables per line (`SimpleHdma_*`), and the framework's beam ALSO ran
+`dma_doHdma` from `snes_advance_beam`. The framework has a gate for exactly
+this (`snes_set_hdma_beam_enabled`, snes.h documents it), but the gated call was
+added *beside* the ungated one it was meant to replace (snesrecomp fd173d2,
+2026-08-28) instead of replacing it, so the gate gated nothing and, with the
+beam owning HDMA, every table was consumed **twice per HBlank**.
+
+The second pass re-ran channel 3's table from the frame's first entry (mode
+`$09`) while this host's raster loop had already advanced to the second (mode
+`$07`). It fires from inside guest register writes — `STY $4209` in the IRQ
+vector syncs the master clock, the beam advances, and the beam runs HDMA — so
+it lands only when that write happens to cross an HBlank: about one frame in
+eighty. A host backtrace at a trapped `$2105` write named the whole chain:
+`bank_80_9870_M0X0 → cpu_write16 → WriteRegWord → WriteReg →
+snes_sync_master_clock → snes_advance_beam → dma_doHdma → ppu_write`.
+
+### Fix
+
+- snesrecomp: delete the two ungated pre-gate calls in `snes_advance_beam`
+  (`dma_doHdma` per HBlank and `dma_initHdma` at field wrap) so the gate works
+  and beam HDMA runs once. Regression test in `tests/dma/hdma_timing_test.c`:
+  two single-line entries writing different values to one register must leave
+  the FIRST after one HBlank, and `hdmaBeamOff` must leave the register
+  untouched. It fails on the pre-fix engine and passes after.
+- `src/sm_rtl.c`: `snes_set_hdma_beam_enabled(g_snes, false)` at the top of
+  `SmDrawPpuFrame` — this loop is the frame's HDMA engine. Set every frame,
+  not once at boot: a save-state load restores the `Snes` struct it lives in.
+
+### Verified
+
+Reproduced headlessly and deterministically (`fuzz0` script, frame 2198): the
+present dump shows the garbage frame between two clean ones, luma 113.1 against
+52.7/52.5. After the fix that frame's CRC equals its successor's and every
+other frame in the range is byte-identical, so the change touches the corrupt
+frame and nothing else. Across ~70k scripted frames the class is gone; the
+anomalies that remain are `hdmaen=00` frames where the guest itself changes
+BGMODE for one frame during a door transition.
+
+### Tooling added
+
+- Framework: `SNESRECOMP_SCREENSHOT_DIR` (+ `_FROM`/`_TO`) dumps every
+  **present** as `present_NNNNNN.ppm` with a `presents.csv` of present, frame,
+  interpolation weight, CRC32 and mean luma; `SNESRECOMP_PRESENT_LOG` writes
+  the CSV alone, so a long session can be scanned for the one present that is
+  wrong before dumping any pictures. A flicker is a claim about the relation
+  between consecutive presents, and a per-simulated-frame dump hides exactly
+  the pair that differs.
+- `SM_RASTER_PROBE=<path>`: the shape of each rendered frame (IRQ schedule,
+  TM/BG3SC left behind, HDMA mask armed, per-line BG-mode run-length), written
+  on change plus a line for any frame differing from BOTH neighbours.
+- `tools/snesref` now builds and runs on Linux (dlopen instead of
+  LoadLibrary), so the oracle's frame dumps are available beside the recomp's.
+
 ## Open items
 
 1. **Next attract blocker** — the f2689 freeze is fixed and the demo now plays
