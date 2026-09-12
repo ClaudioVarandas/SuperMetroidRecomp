@@ -134,7 +134,10 @@ if [ "$STRICT_IDEMPOTENT" -eq 1 ]; then
     esac
   done
   "$PYTHON" "$CLI" generate "${SECOND_ARGS[@]}"
-  if diff -r --brief src/gen "$SCRATCH/gen"; then
+  # --exclude .gitkeep: src/gen carries a tracked placeholder so the directory
+  # survives in git while its contents are ignored. The scratch tree has no
+  # such file, and comparing it reports a difference that is not one.
+  if diff -r --brief --exclude=.gitkeep src/gen "$SCRATCH/gen"; then
     echo "ok: two generations produced byte-identical output"
   else
     echo "regen.sh: generation is NOT idempotent (differences above)" >&2
