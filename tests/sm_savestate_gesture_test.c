@@ -6,6 +6,7 @@
  * after it closes, every frame, so the game never runs again. This drives the
  * module the way a host does and asserts the loop terminates. */
 #include <stdio.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include "snes_savestate_menu.h"
 #include "snes_overlay_draw.h"
@@ -15,6 +16,11 @@
  * test is the input guard, which touches none of them. */
 #include "common_rtl.h"
 void RtlSaveLoad(int t, int slot) { (void)t; (void)slot; }
+/* The menu now saves/loads through snapshot paths directly (framework
+ * 2026-09); the gesture under test never reaches them. */
+void RtlEnsureSaveDir(void) { }
+bool RtlSaveSnapshot(const char *filename) { (void)filename; return false; }
+bool RtlLoadSnapshot(const char *filename) { (void)filename; return false; }
 void RtlSaveSlotPath(int slot, char *buf, size_t buflen) {
     if (buf && buflen) snprintf(buf, buflen, "/nonexistent/slot%d.sav", slot);
 }

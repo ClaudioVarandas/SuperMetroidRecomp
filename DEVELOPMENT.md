@@ -423,6 +423,26 @@ the scaffold; windowed SDL and OpenGL presenters both initialize and present
 `test_emit_function_smoke` failures), new `test_host_clock` registered.
 Headless screenshots: `SNESRECOMP_SCREENSHOT=<ppm> SNESRECOMP_SCREENSHOT_FRAME=<n>`.
 
+## 2026-09-12 — overlays with a controller: "the save-state menu freezes the game"
+
+Report (DualSense, both repos): the browser opened by Select+R and then
+nothing happened; rewind never opened. Causes, both in the host (now
+framework-owned, so one fix): (1) the overlay modal pumps handled quit and
+keyboard events only, so the pad's d-pad/B/shoulders never reached the panel
+-- a keyboard player never saw it and the word-injecting self-test enters
+below the event layer, so it never saw it either; (2) nothing bound rewind:
+the framework left SaveStateMenu/Rewind unbound (F7/F8 collide with LoadState
+slots), this repo's config.ini did not bind them, and the host had no pad
+gesture. Fixes: one HandleDeviceEvent for the main loop and both pumps;
+`[Controller] RewindGesture` (Select+R3 default) parsed by the host; default
+keys F11/F12 in the framework config; pad-bound system commands dropped while
+a panel is up; buttons held when a panel closes masked until released (the
+closing B leaked a jump). Test: `SNESRECOMP_OVERLAY_SELFTEST_PAD=<frame>`
+attaches a virtual gamepad and drives both panels through SDL events; the
+first version of it passed vacuously (a real pad took player 1) and then
+pressed the SNES A instead of B -- both caught by the guest trace, which must
+be byte-identical with the test armed.
+
 ## Open items
 
 1. **Next attract blocker** — the f2689 freeze is fixed and the demo now plays

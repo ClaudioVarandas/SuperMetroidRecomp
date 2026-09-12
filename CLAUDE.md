@@ -87,16 +87,18 @@ fix them in `snesrecomp/` so every port inherits it.
 
 ### In-game overlays
 
-The save-state slot browser (Select+R, or `[KeyMap] SaveStateMenu`) and the
-rewind filmstrip (`[KeyMap] Rewind`) are framework modules
-(`snes_savestate_menu.c`, `snes_rewind.c`). They were linked into every build
-of this port and unreachable until 2026-09, because `main.c` never called them
-and the forked `config.h` predated their two key-map entries. `main.c` now
-wires them: the open gestures read the HUMAN input word only (never
-`TickScript`'s, or a scripted repro could open a modal panel it cannot close),
-and the panels composite into the frame buffer via `snes_ovl_blit_panel()`
-rather than into a second texture — this host's presenter is chosen at runtime
-(SDL_Renderer or OpenGL) and a texture-level blit would need writing twice.
+The save-state slot browser (Select+R on the pad, or `[KeyMap] SaveStateMenu`,
+F11) and the rewind filmstrip (`[Controller] RewindGesture`, Select+R3 by
+default, or `[KeyMap] Rewind`, F12) are framework modules driven by the
+framework host. The guest is frozen while a panel is up; the host presents the
+last frame with the panel composited at 512x448 and never runs guest code from
+a modal loop. Two bugs this port shipped and that now have tests: the modal
+pumps dropped controller events, so a pad player saw a frozen game and a panel
+that ignored them (`SNESRECOMP_OVERLAY_SELFTEST_PAD=<frame>` drives both panels
+with a virtual gamepad through real SDL events); and the button that closes a
+panel leaked into the guest for a frame (held-at-close buttons are masked
+until released). A traced run with either self-test armed must match one
+without it.
 
 ### Widescreen
 
