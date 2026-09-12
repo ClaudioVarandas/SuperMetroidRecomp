@@ -606,6 +606,35 @@ per displayed frame -- against a 16.6 ms budget.
 suspended several frames deep in a recursion is snapshotted, run forward,
 restored, and must carry on from the restored point.
 
+## 2026-09-12 — "Warning! DMA from addr 0x9a0000" is the game, wrapping a bank
+
+Printed on every run, and benign. At frame 1020 Super Metroid programs a 16 KB
+VRAM upload from `$9A:D200` through `SetupDmaTransfer` ($80:91A9), from a
+record that is literal ROM data at `$82:8319` (`01 18 00 D2 9A 00 40`). Bank
+`$9A` has 11,776 bytes left from that address, so the transfer wraps at the
+bank boundary and spends its last 4,608 bytes at `$9A:0000` -- which on this
+LoROM cartridge is the WRAM mirror. A DMA's A-bus address wraps within its
+bank and never carries into the next one, so hardware reads the same bytes,
+and the recompilation is faithful.
+
+The framework's check sat in the per-byte transfer loop, asking whether a
+`$80+` bank was being read below `$8000` -- exactly what an authentic wrap
+looks like partway through, which is why the reported size (4,608) was the
+remainder rather than the programmed 16 KB. Fixed upstream by asking once,
+where the channel is armed, from the address the game programmed.
+
+Two things this cost while it stood: the report was on stdout while the host's
+breadcrumbs are on stderr, so in a merged log it appeared beside "first frame
+simulated" for something that happened at frame 1020; and it set `g_fail`,
+the latch that also gates the off-rails ROM-pointer report, so one false
+positive silenced a real diagnostic for the rest of the session.
+
+Found alongside a regression of mine in the same log: run-ahead's rollback was
+reading as a timeline jump, so the host tore down and rebuilt its 17.5 MB
+rewind ring every frame (that is the repeated "[snes_rewind] 60 snapshots
+every 6 frames"). Rewind kept no history at all while run-ahead was on. Also
+fixed upstream, by carrying the state generation across a rollback.
+
 ## Open items
 
 1. **Next attract blocker** — the f2689 freeze is fixed and the demo now plays
