@@ -120,4 +120,4 @@ gaps. Full regeneration remains mandatory after changing generation inputs.
 
 ## Configuration
 
-`config.ini` (tracked) holds runtime settings: hotkeys, gamepad maps, renderer/audio options. Per-developer overrides go in `config.local.ini` (gitignored), applied after `config.ini`.
+`config.ini` (tracked) holds this port's tuned defaults: hotkeys, gamepad maps, renderer/audio options. The host reads the copy **beside the executable** (`build-release/config.ini`), which the build seeds from the tracked file once (`snesrecomp_target_config_seed`) and which is the player's afterwards: the launcher and the host write settings back into it. A change to the tracked file therefore reaches an existing build tree only by deleting that copy, or through the framework's key migrations (a former generated default is rewritten to the current one, once, with a breadcrumb). Per-developer overrides go in `config.local.ini` (gitignored), applied after `config.ini`. `SNESRECOMP_KEYMAP_DUMP=1` prints what the system hotkeys resolved to.
