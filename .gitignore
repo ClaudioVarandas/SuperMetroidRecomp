@@ -79,3 +79,16 @@ android/.gradle/
 android/app/build/
 android/app/.cxx/
 android/local.properties
+
+# --- SNES recomp (Studio) ---
+/src/gen/
+/recomp/funcs.h
+/build/
+/build-*/
+/dist/
+/saves/
+/rom.cfg
+/keybinds.ini
+/config.ini
+/input.ini
+/analysis/
