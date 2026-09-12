@@ -43,6 +43,24 @@ if(BUILD_TESTING AND NOT ANDROID)
         ${SNESRECOMP_ROOT}/runner/src)
     add_test(NAME sm_overlay_blit COMMAND sm_overlay_blit_test)
 
+    # The open-gesture guard. A host that skips it gets a browser that
+    # reopens the frame after it closes, forever -- a frozen game.
+    add_executable(sm_savestate_gesture_test
+        tests/sm_savestate_gesture_test.c
+        ${SNESRECOMP_ROOT}/runner/src/snes_savestate_menu.c
+        ${SNESRECOMP_ROOT}/runner/src/snes_overlay_draw.c)
+    target_include_directories(sm_savestate_gesture_test PRIVATE
+        ${SNESRECOMP_ROOT}/runner/src ${SNESRECOMP_ROOT}/runner/src/desktop)
+    # snes_savestate_menu.c reaches SDL only for the SDLK_* keycodes, so the
+    # headers are enough; nothing here links an SDL library.
+    find_package(PkgConfig QUIET)
+    if(PkgConfig_FOUND)
+        pkg_check_modules(SM_TEST_SDL2 QUIET sdl2)
+        target_include_directories(sm_savestate_gesture_test PRIVATE
+            ${SM_TEST_SDL2_INCLUDE_DIRS})
+    endif()
+    add_test(NAME sm_savestate_gesture COMMAND sm_savestate_gesture_test)
+
     add_executable(ppu_window_test tests/ppu_window_test.c)
     target_include_directories(ppu_window_test PRIVATE
         ${SNESRECOMP_ROOT}/runner/src)

@@ -267,6 +267,11 @@ static struct RendererFuncs g_renderer_funcs;
 static int g_savestate_menu_hotkey;
 static int g_rewind_hotkey;
 
+/* The last field actually presented, kept so an overlay can freeze the guest
+ * and still have something to draw behind itself. Sized like g_my_pixels. */
+static uint8_t g_frozen_frame[kPpuBufWidth * 4 * 240];
+static int g_frozen_w, g_frozen_h;
+
 static GamepadInfo g_gamepad[2];
 
 extern Snes *g_snes;
@@ -754,21 +759,25 @@ static void DrawPpuFrameWithPerf(void) {
   if (g_display_perf)
     RenderNumber(pixel_buffer + pitch * render_scale, pitch, g_curr_fps, render_scale == 4);
 
-  /* Overlay panels composite into the frame the presenter is about to take,
-   * rather than into a second texture: this host's presenter is chosen at
-   * runtime (SDL_Renderer or OpenGL), and a texture-level blit would have to
-   * be written once per backend. */
+
+  /* Keep a copy of what was just presented. An overlay freezes the guest, and
+   * the backdrop behind it has to come from somewhere that is NOT another
+   * call to the game's draw_ppu_frame -- that runs guest code (SmDrawPpuFrame
+   * pushes an interrupt frame and runs I_IRQ per raster split), so calling it
+   * from a modal loop pushes an interrupt frame every 8ms into a guest that
+   * is not executing. That is what locked the game up when the save-state
+   * browser was opened. */
   {
-    const uint32_t *panel = NULL;
-    int pw = 0, ph = 0;
-    if (snes_savestate_menu_overlay_image(&panel, &pw, &ph) && panel)
-      snes_ovl_blit_panel(pixel_buffer, pitch,
-                          g_snes_width * render_scale,
-                          g_snes_height * render_scale, panel, pw, ph);
-    else if (snes_rewind_overlay_image(&panel, &pw, &ph) && panel)
-      snes_ovl_blit_panel(pixel_buffer, pitch,
-                          g_snes_width * render_scale,
-                          g_snes_height * render_scale, panel, pw, ph);
+    const int rows = g_snes_height * render_scale;
+    const int row_bytes = g_snes_width * render_scale * 4;
+    if (rows > 0 && row_bytes > 0 &&
+        (size_t)rows * (size_t)row_bytes <= sizeof(g_frozen_frame)) {
+      for (int y = 0; y < rows; y++)
+        memcpy(g_frozen_frame + (size_t)y * (size_t)row_bytes,
+               pixel_buffer + (size_t)y * (size_t)pitch, (size_t)row_bytes);
+      g_frozen_w = g_snes_width * render_scale;
+      g_frozen_h = rows;
+    }
   }
 
   SmProfileEnd(kSmProfileCompose, profile_start);
@@ -783,36 +792,73 @@ static uint32 OverlayNavInputs(void) {
   return g_input_state | g_pad_buttons | g_gamepad[0].axis_buttons;
 }
 
-/* Modal pump shared by both overlays.
+/* Present a frozen field with an overlay on top, WITHOUT running guest code.
  *
- * The guest is FROZEN for the duration: this loop never calls RtlRunFrame,
- * only re-presents the last rendered field with the panel composited over
- * it. That is what makes "save right here" mean a definite point in time,
- * and it is why audio goes quiet while a panel is open.
+ * The draw buffer is requested at the panel's own resolution (512x448, twice
+ * the SNES field) so the panel lands 1:1 and its text stays crisp, with the
+ * frozen game upscaled behind it. Compositing into the 256-wide game buffer
+ * instead halved the panel and made it noticeably coarser than the same
+ * overlay looks in other ports.
  *
- * `is_open` / `close` / `handle_key` / `poll_nav` are the framework module's;
- * this function owns only the SDL pumping and the presenting, which is the
- * division of labour both overlay headers ask for. */
-static void RunOverlayModalLoop(int (*is_open)(void),
-                                void (*close_fn)(void),
-                                void (*handle_key)(int key, int repeat),
-                                void (*poll_nav)(uint32_t inputs, uint32_t ticks),
-                                bool *running) {
-  while (is_open() && *running) {
+ * Placement is per-overlay, because the two modules draw for different
+ * shapes: the save-state browser is an opaque full-rect panel, the rewind
+ * filmstrip belongs across the bottom third of the frame, annotating the
+ * moment it describes. */
+static void PresentFrozenWithOverlay(void) {
+  const uint32_t *panel = NULL;
+  int pw = 0, ph = 0;
+  int is_menu = snes_savestate_menu_overlay_image(&panel, &pw, &ph) && panel;
+  if (!is_menu && !(snes_rewind_overlay_image(&panel, &pw, &ph) && panel))
+    panel = NULL;
+
+  const int draw_w = (panel && pw > 0) ? pw : g_snes_width;
+  const int draw_h = (panel && ph > 0) ? ph : g_snes_height;
+  uint8 *pixel_buffer = 0;
+  int pitch = 0;
+
+  g_renderer_funcs.BeginDraw(draw_w, draw_h, &pixel_buffer, &pitch);
+  if (!pixel_buffer)
+    return;
+
+  if (g_frozen_w > 0 && g_frozen_h > 0)
+    snes_ovl_upscale_frame(pixel_buffer, pitch, draw_w, draw_h,
+                           (const uint32_t *)g_frozen_frame,
+                           g_frozen_w * 4, g_frozen_w, g_frozen_h);
+  else
+    memset(pixel_buffer, 0, (size_t)draw_h * (size_t)pitch);
+
+  if (panel) {
+    if (is_menu) {
+      snes_ovl_blit_panel_rect(pixel_buffer, pitch, draw_w, draw_h,
+                               panel, pw, ph, 0, 0, draw_w, draw_h);
+    } else {
+      const int strip_h = draw_h / 3;
+      snes_ovl_blit_panel_rect(pixel_buffer, pitch, draw_w, draw_h,
+                               panel, pw, ph,
+                               0, draw_h - strip_h, draw_w, strip_h);
+    }
+  }
+  g_renderer_funcs.EndDraw();
+}
+
+/* Save-state browser's modal pump. The guest is FROZEN throughout: this loop
+ * never calls RtlRunFrame and never calls the game's draw_ppu_frame, which is
+ * what makes "save right here" a definite point in time. */
+static void RunSavestateMenuLoop(bool *running) {
+  while (snes_savestate_menu_is_open() && *running) {
     SDL_Event event;
     while (SDL_PollEvent(&event)) {
       switch (event.type) {
       case SDL_QUIT:
         *running = false;
-        close_fn();
+        snes_savestate_menu_close();
         break;
       case SDL_KEYDOWN:
         /* Straight to the overlay, NOT through HandleInput: the game's own
          * hotkeys must not fire while a panel owns the screen (F1 would load
          * a state behind the browser that is asking which state to load). */
-        if (handle_key)
-          handle_key(SNESRECOMP_SDL_EVENT_KEY(event),
-                     SNESRECOMP_SDL_EVENT_REPEAT(event));
+        snes_savestate_menu_handle_key(SNESRECOMP_SDL_EVENT_KEY(event),
+                                       SNESRECOMP_SDL_EVENT_REPEAT(event));
         break;
       case SDL_KEYUP:
         /* Keep the keyboard's view of held keys honest so a direction held
@@ -822,11 +868,59 @@ static void RunOverlayModalLoop(int (*is_open)(void),
         break;
       }
     }
-    if (poll_nav)
-      poll_nav(OverlayNavInputs(), SDL_GetTicks());
-    DrawPpuFrameWithPerf();
+    snes_savestate_menu_poll_nav(OverlayNavInputs(), SDL_GetTicks());
+    PresentFrozenWithOverlay();
     SDL_Delay(8);
   }
+}
+
+/* Rewind's modal pump. It needs its own: snes_rewind exposes step/commit/close
+ * rather than the browser's handle_key/poll_nav, so a shared pump handed NULL
+ * for both -- which is what shipped, and meant the filmstrip could be opened
+ * and then never closed. Controls match the other ports: Left/Right scrub,
+ * Enter or Space commits, Escape cancels, and the pad mirrors them. */
+static void RunRewindLoop(bool *running) {
+  uint32 prev_pad = 0;
+  while (snes_rewind_is_open() && *running) {
+    SDL_Event event;
+    while (SDL_PollEvent(&event)) {
+      switch (event.type) {
+      case SDL_QUIT:
+        *running = false;
+        snes_rewind_close();
+        break;
+      case SDL_KEYDOWN:
+        switch (SNESRECOMP_SDL_EVENT_KEY(event)) {
+        case SDLK_LEFT:   snes_rewind_step(-1); break;
+        case SDLK_RIGHT:  snes_rewind_step(+1); break;
+        case SDLK_RETURN:
+        case SDLK_SPACE:  snes_rewind_commit(); break;
+        case SDLK_ESCAPE: snes_rewind_close();  break;
+        default: break;
+        }
+        break;
+      case SDL_KEYUP:
+        HandleInput(SNESRECOMP_SDL_EVENT_KEY(event),
+                    SNESRECOMP_SDL_EVENT_MOD(event), false);
+        break;
+      }
+    }
+    {
+      /* Edge-triggered: holding Left must not sprint through the whole ring
+       * in a single pass of this loop. */
+      const uint32 pad = OverlayNavInputs();
+      const uint32 pressed = pad & ~prev_pad;
+      if (pressed & SNES_PAD_LEFT)  snes_rewind_step(-1);
+      if (pressed & SNES_PAD_RIGHT) snes_rewind_step(+1);
+      if (pressed & SNES_PAD_A)     snes_rewind_commit();
+      if (pressed & SNES_PAD_B)     snes_rewind_close();
+      prev_pad = pad;
+    }
+    PresentFrozenWithOverlay();
+    SDL_Delay(8);
+  }
+  SmRendererReset();
+  g_sm_reset_clock = true;
 }
 
 static SDL_mutex *g_audio_mutex;
@@ -1995,7 +2089,20 @@ error_reading:;
       }
     }
 
-    uint32 inputs = g_input_state | g_pad_buttons | g_gamepad[0].axis_buttons | g_gamepad[1].axis_buttons << 12;
+    /* Seat 0's HUMAN word, kept separate from the script's and the debug
+     * server's: the overlays are human facilities, and a repro script must
+     * never be able to open a modal panel it has no way to close.
+     *
+     * Filtered ONCE per frame, and the filtered word is what both the guest
+     * and the open gesture see -- which is what snes_savestate_menu.h asks
+     * for, in those words. Passing the unfiltered word to the gesture (as
+     * this did) means the button still held when the browser closed
+     * re-satisfies Select+R on the very next frame, so it reopens
+     * immediately, every frame, and the game never advances again. That is
+     * the lock-up, and a resting analog stick or a held shoulder button is
+     * enough to trigger it. */
+    uint32 human = snes_savestate_menu_filter_guest_input(OverlayNavInputs());
+    uint32 inputs = human | (g_gamepad[1].axis_buttons << 12);
     inputs |= TickScript();
     inputs |= debug_server_get_controller_inputs();
 
@@ -2005,35 +2112,81 @@ error_reading:;
      * The filter masks anything still held when a panel closed until it is
      * released, so the press that closed the browser neither reaches the
      * game nor immediately reopens it. */
-    inputs = snes_savestate_menu_filter_guest_input(inputs);
+    /* Overlay self-test (SM_OVERLAY_SELFTEST=<frame>, off by default).
+     *
+     * The overlays can only be driven by a human, so nothing automated ever
+     * exercised the modal path -- and what shipped there froze the game: the
+     * pump called the game's draw_ppu_frame, which runs guest code (an
+     * interrupt frame and I_IRQ per raster split), every 8ms into a guest
+     * that was supposed to be stopped.
+     *
+     * This opens the browser at a chosen frame, pumps the present path the
+     * modal loop uses, closes it, and lets the run continue. The property
+     * being checked is exact: a frozen overlay must leave the guest BIT
+     * IDENTICAL, so a traced run with this armed must match one without it. */
+    {
+      static long selftest_frame = -2;
+      if (selftest_frame == -2) {
+        const char *v = getenv("SM_OVERLAY_SELFTEST");
+        selftest_frame = (v && *v) ? strtol(v, NULL, 0) : -1;
+      }
+      if (selftest_frame >= 0 && (long)frameCtr == selftest_frame) {
+        fprintf(stderr, "[overlay_selftest] opening save-state browser at frame %ld\n",
+                selftest_frame);
+        (void)snes_savestate_menu_poll_open(SNES_PAD_SELECT | SNES_PAD_R);
+        if (!snes_savestate_menu_is_open()) {
+          fprintf(stderr, "[overlay_selftest] FAILED: gesture did not open it\n");
+        } else {
+          for (int i = 0; i < 30; i++)
+            PresentFrozenWithOverlay();
+          /* SM_OVERLAY_SELFTEST_SAVELOAD=1 also drives the menu's own
+           * save and load, which is the path a player actually uses and the
+           * one that reads as "it froze". Save/load are pad-only (X saves,
+           * A loads), so this synthesizes those edges. */
+          if (getenv("SM_OVERLAY_SELFTEST_SAVELOAD")) {
+            uint32_t t = SDL_GetTicks();
+            fprintf(stderr, "[overlay_selftest] pad X (save)...\n");
+            snes_savestate_menu_poll_nav(SNES_PAD_X, t);
+            snes_savestate_menu_poll_nav(0, t + 1);
+            PresentFrozenWithOverlay();
+            fprintf(stderr, "[overlay_selftest] pad A (load)...\n");
+            snes_savestate_menu_poll_nav(SNES_PAD_A, t + 2);
+            snes_savestate_menu_poll_nav(0, t + 3);
+            fprintf(stderr, "[overlay_selftest] after load, menu is %s\n",
+                    snes_savestate_menu_is_open() ? "open" : "closed");
+          }
+          snes_savestate_menu_close();
+          fprintf(stderr, "[overlay_selftest] pumped 30 present passes, closed: %s\n",
+                  snes_savestate_menu_is_open() ? "STILL OPEN" : "ok");
+          SmRendererReset();
+          g_sm_reset_clock = true;
+        }
+      }
+    }
+
     if (g_rewind_hotkey && !snes_rewind_is_open() &&
         !snes_savestate_menu_is_open()) {
       /* Refused during netplay by snes_rewind_open() itself: one machine
        * cannot move its own clock backwards while a peer is watching. */
-      if (snes_rewind_open())
-        RunOverlayModalLoop(&snes_rewind_is_open, &snes_rewind_close, NULL,
-                            NULL, &running);
+      if (snes_rewind_open()) {
+        RunRewindLoop(&running);
+        continue;   /* guest was frozen: no frame to run or present */
+      }
     }
     g_rewind_hotkey = 0;
-    /* The Select+R gesture is tested on the HUMAN input word, not on
-     * `inputs`: `inputs` carries TickScript's output, and a scripted repro
-     * that happened to hold Select+R would open a modal panel that the same
-     * script cannot navigate or close (OverlayNavInputs excludes the script
-     * too, deliberately). That is an unattended run wedged forever. */
-    if (g_savestate_menu_hotkey ||
-        snes_savestate_menu_poll_open(OverlayNavInputs())) {
+    /* Exactly ONE poll_open per frame: it latches the previous word to edge
+     * detect on, so a second call in the same frame eats the edge. */
+    (void)snes_savestate_menu_poll_open(human);
+    if (g_savestate_menu_hotkey) {
       g_savestate_menu_hotkey = 0;
       if (!snes_savestate_menu_is_open())
         (void)snes_savestate_menu_poll_open(SNES_PAD_SELECT | SNES_PAD_R);
-      if (snes_savestate_menu_is_open()) {
-        RunOverlayModalLoop(&snes_savestate_menu_is_open,
-                            &snes_savestate_menu_close,
-                            &snes_savestate_menu_handle_key,
-                            &snes_savestate_menu_poll_nav, &running);
-        SmRendererReset();
-        g_sm_reset_clock = true;
-        continue;   /* guest was frozen: no frame to run or present */
-      }
+    }
+    if (snes_savestate_menu_is_open()) {
+      RunSavestateMenuLoop(&running);
+      SmRendererReset();
+      g_sm_reset_clock = true;
+      continue;   /* guest was frozen: no frame to run or present */
     }
     g_sm_profile_frame = frameCtr + 1;
     if (profile_requested && !g_sm_profile && g_sm_profile_frame >= profile_first) {
