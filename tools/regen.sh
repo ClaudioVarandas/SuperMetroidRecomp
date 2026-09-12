@@ -78,20 +78,6 @@ fi
 
 GEN_ARGS=(--rom "$ROM" --cfg-dir recomp --out-dir src/gen
           --funcs-h recomp/funcs.h --project-root "$ROOT")
-# This title's own generation inputs. The PIPELINE is the framework's
-# (snesrecomp_cli generate); these two are declarations about Super Metroid,
-# which is why they are the only lines here that are not the wizard's:
-#   --source-root src            host roots live in src/, so root discovery
-#                                has to look there as well as in recomp/*.cfg
-#   --profile-manifest ...       tier-2 coverage that seeds optional AOT roots.
-#                                Dropping it changes which functions are AOT
-#                                vs LLE, i.e. changes the generated C.
-# Both are plain snesrecomp_cli options (see `generate --help`), so nothing
-# here forks the engine's pipeline.
-GEN_ARGS+=(--source-root src --profile-manifest profiles/attract_tier2.json)
-if [ -n "${SNESRECOMP_ANALYSIS_BACKEND:-}" ]; then
-  GEN_ARGS+=(--analysis-backend "$SNESRECOMP_ANALYSIS_BACKEND")
-fi
 if [ "$CFG_ROOTS" -eq 1 ]; then GEN_ARGS+=(--cfg-roots); fi
 if [ "$VERIFY" -eq 1 ]; then GEN_ARGS+=("${VERIFY_ARGS[@]}"); fi
 

@@ -44,6 +44,12 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <errno.h>
+#ifdef _WIN32
+#include <direct.h>
+#else
+#include <sys/stat.h>
+#endif
 
 #include "post_mortem.h"
 #include "host_report.h"
@@ -739,8 +745,22 @@ void recomp_post_mortem_dump(const char *reason, void *fault_info) {
     if (is_crash)
         host_report_write_minidump(fault_info);
 
+    /* The path is relative to the anchored config dir; a tree without a
+     * build/ subdirectory (build-release/, an installed copy) silently lost
+     * every report until now.  Create it, and say so when it still fails —
+     * an always-on instrument must not go dark quietly. */
+#ifdef _WIN32
+    _mkdir("build");
+#else
+    mkdir("build", 0755);
+#endif
     FILE *f = fopen(kReportPath, "w");
-    if (!f) { dump_unlock(); return; }
+    if (!f) {
+        fprintf(stderr, "[post_mortem] cannot write %s: %s\n", kReportPath,
+                strerror(errno));
+        dump_unlock();
+        return;
+    }
 
     char timebuf[64] = "?";
     time_t tt = time(NULL);

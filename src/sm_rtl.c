@@ -139,6 +139,12 @@ void RunOneFrameOfGame(void) {
      * later frame injects NMI and resumes at that exact guest PC.  The guest
      * stack retains arbitrary-depth coroutine continuations, while compiled
      * bodies bounce through the paired ABI without a host fiber. */
+    /* A contained bridge bail (see interp_bridge_run_loop returning 0) leaves
+     * the guest stack half-unwound; re-entering every frame from the stale
+     * resume PC executed garbage until it hit InvalidInterrupt_Crash and
+     * could reach save RAM on the way.  Stay stopped, like the fiber path. */
+    if (g_game_done)
+      return;
     uint32_t entry_pc = g_lle_resume_pc;
     if (!g_game_started) {
       cpu_state_init(&g_cpu, g_ram);

@@ -332,6 +332,70 @@ loop. Samus drawn every frame (6195 probe samples), process healthy. **UNCOMMITT
 Caveat: `stack_balance` in `last_run_report.json` counts the frame pop (balanced
 JSR=+2, JSL=+3) — not a true-leak signal; use the S-boundary probe.
 
+## Milestone (2026-09-11): Start at title -> file select crash FIXED (scheduler-frame watermark)
+
+### Symptom
+Pressing Start on the title screen: `[interp_cap] entry=$809589 last=$808573`
+(NMI handler spinning in `InvalidInterrupt_Crash $80:8573`), then
+`entry=$5C0080` garbage PCs, `sp=$0002/$FFF7/...`, `Warning! DMA from addr
+0x950795`, `[sm_rtl] LLE loop bailed`. All downstream.
+
+### Root cause (measured)
+Headless repro (`SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy --script`, Start
+for 8 frames at frame ~600 = title) with `SNESRECOMP_INTERP_TRACE=1`:
+`[interp_bridge] yield-mode NLR exit (non-unwind) _air=1 target=$8091A9
+frame=633 site=$818DED sp_pre=$1FF0 sp=$1FF6 s_enter=$1FEC`.
+Game state 1 -> 4 (FileSelectMenus). `FileSelectMenu_0_FadeOutConfigGfx`
+($81:944E) calls `WaitUntilEndOfVblankAndClearHdma` -> (JSR) `WaitForNMI`;
+the whole-program LLE frame resumes INSIDE that WaitForNMI at S=$1FEC, so
+`s_exit`/`s_interp_owner_exit_s` = $1FEC. WaitForNMI returns, and
+`LoadInitialMenuTiles` ($81:8DDB, interpreted, M1X1 after `SEP #$30`) does
+`JSL SetupDmaTransfer` ($80:91A9) at S=$1FF0. SetupDmaTransfer is compiled for
+M1 and rewrites its return address (+8 inline parameter bytes); its RTL took
+`interp_tier_dispatch_rewritten_return`, whose `crossed_into_compiled_ancestor`
+saw post-return S ($1FF0..) above the owner watermark ($1FEC) and concluded the
+rewrite belonged to a compiled ancestor. It ran the continuation in a NESTED
+tier frame and returned SKIP_1; the yield-mode bounce site then took the
+"non-unwind NLR" exit, reported the frame as complete, and the next host frame
+injected NMI at the stale resume PC over a half-unwound stack -> garbage ->
+BRK/COP -> `$80:8573`.
+
+The watermark is meaningless for a scheduler/whole-program frame: it entered at
+whatever S the previous frame yielded from, and its program legitimately runs
+above that S every frame (the RTS watermark was already disabled for
+`yield_pc` mode for the same reason; the three owner-crossing checks were not).
+
+### Fix (class, runtime-only, NO regen) — `snesrecomp/runner/src/snes/interp_bridge.c`
+- `s_interp_owner_is_scheduler` recorded per bridge frame (`yield_pc != 0`);
+  `interp_owner_crossed(post_s)` is the single predicate, false for scheduler
+  owners. Used by `interp_tier_dispatch_rewritten_return`,
+  `interp_bridge_return_targets_owner`, and the bounce-site `_skip_crossed_owner`.
+- A scheduler frame that still receives an unconsumable SKIP_N now bails
+  contained (`return 0`) instead of reporting a completed frame; `sm_rtl.c`
+  honours `g_game_done` in the LLE path so a bail stays stopped (it used to
+  re-run frames from the stale PC every frame, executing garbage).
+- Diagnostics kept: the low-exec tripwire dumps the always-on 8192-step ring
+  (the 64-entry local window was all `$FF` padding); the yield-mode NLR log now
+  carries frame/site/sp/s_enter.
+- Regression test `S8d` in `tests/interp816/bridge_test.c` (harness now models
+  `g_recomp_stack_top` like the real `RecompStackPush`, without which the
+  crossing branch was untestable). Fails without the fix (aot_called=124),
+  passes with it: 104/104.
+- `src/post_mortem.c`: creates `build/` and reports a failed report write —
+  `build-release/` had no `build/` subdir, so the "always-on" post-mortem had
+  been silently writing nothing.
+
+### Verified (instrument state; on-screen verdict pending Alex)
+Headless 1250-frame run, Start at 602/810/1010: game_state 1 -> 4 (632) -> 2
+(890) -> $1E (1020), zero caps / low-exec / NLR / bails / DMA warnings.
+WRAM low-8K trace pre- vs post-fix identical through frame 632 except stack
+bytes and one 2-frame-cadence counter ($064B) that pre-fix stepped a frame
+early (pre-fix also spent a 2M-step cap in frame 0: boot now 0.6 s vs 2.7 s).
+Not verified: pixels (no headless capture path; earlier windowed runs stole
+focus and ate keystrokes — use the dummy SDL drivers for repro runs).
+Framework v2 suite 399/402 (3 pre-existing `test_emit_function_smoke`
+failures, emitter-side, untouched). **UNCOMMITTED.**
+
 ## Open items
 
 1. **Next attract blocker** — the f2689 freeze is fixed and the demo now plays
