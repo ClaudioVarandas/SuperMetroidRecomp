@@ -23,12 +23,14 @@ cd "$ROOT"
 
 VERIFY=1
 CFG_ROOTS=0
+STRICT_IDEMPOTENT=0
 ROM="${SNESRECOMP_ROM:-}"
 while [ $# -gt 0 ]; do
   case "$1" in
     --rom) ROM=$2; shift 2 ;;
     --no-verify) VERIFY=0; shift ;;
     --cfg-roots) CFG_ROOTS=1; shift ;;
+    --strict-idempotent) STRICT_IDEMPOTENT=1; shift ;;
     -h|--help) sed -n '2,/^set -euo/p' "$0" | sed -n '/^# /p' | sed 's/^# //'; exit 0 ;;
     *) echo "regen.sh: unknown flag: $1 (try --help)" >&2; exit 2 ;;
   esac
@@ -78,11 +80,67 @@ fi
 
 GEN_ARGS=(--rom "$ROM" --cfg-dir recomp --out-dir src/gen
           --funcs-h recomp/funcs.h --project-root "$ROOT")
+
+# This title's own generation inputs. The PIPELINE is the framework's
+# (snesrecomp_cli generate); these two are declarations about Super Metroid,
+# which is why they are the only lines here that are not the wizard's:
+#   --source-root src            host roots live in src/, so root discovery
+#                                has to look there as well as in recomp/*.cfg
+#   --profile-manifest ...       tier-2 coverage that seeds optional AOT roots.
+#                                Dropping it changes which functions are AOT
+#                                vs LLE, i.e. changes the generated C.
+# Both are plain snesrecomp_cli options (see `generate --help`), so nothing
+# here forks the engine's pipeline.
+#
+# These were deleted by the 2026-09-11 template sync, which replaced this
+# script wholesale with the scaffold's copy. That left profiles/attract_tier2.json
+# orphaned and silently changed the AOT/LLE split on the next regen, which is
+# exactly what the comment above warns about. Restored, and the divergence
+# from the stock template is now deliberate and written down.
+PROFILE="profiles/attract_tier2.json"
+if [ ! -f "$PROFILE" ]; then
+  echo "regen.sh: missing $PROFILE — it selects this title's observed AOT work" >&2
+  exit 1
+fi
+GEN_ARGS+=(--source-root src --profile-manifest "$PROFILE")
+if [ -n "${SNESRECOMP_ANALYSIS_BACKEND:-}" ]; then
+  GEN_ARGS+=(--analysis-backend "$SNESRECOMP_ANALYSIS_BACKEND")
+fi
 if [ "$CFG_ROOTS" -eq 1 ]; then GEN_ARGS+=(--cfg-roots); fi
 if [ "$VERIFY" -eq 1 ]; then GEN_ARGS+=("${VERIFY_ARGS[@]}"); fi
 
 echo "== Generating src/gen =="
 "$PYTHON" "$CLI" generate "${GEN_ARGS[@]}"
+
+# --strict-idempotent: generate a SECOND time into a scratch tree and require
+# byte-identical output. Generation is supposed to be a pure function of (ROM,
+# cfg, profile); anything that leaks run order, a timestamp or a hash-map
+# iteration into the emitted C shows up here and nowhere else.
+#
+# README.md, CMakeLists.txt and CLAUDE.md have all documented this flag for a
+# long time while the script rejected it with "unknown flag" -- three dead
+# build instructions. Implemented rather than removed, because the property it
+# checks is worth having.
+if [ "$STRICT_IDEMPOTENT" -eq 1 ]; then
+  echo "== Verifying generation is idempotent =="
+  SCRATCH="$(mktemp -d)"
+  trap 'rm -rf "$SCRATCH"' EXIT
+  SECOND_ARGS=()
+  for a in "${GEN_ARGS[@]}"; do
+    case "$a" in
+      src/gen) SECOND_ARGS+=("$SCRATCH/gen") ;;
+      recomp/funcs.h) SECOND_ARGS+=("$SCRATCH/funcs.h") ;;
+      *) SECOND_ARGS+=("$a") ;;
+    esac
+  done
+  "$PYTHON" "$CLI" generate "${SECOND_ARGS[@]}"
+  if diff -r --brief src/gen "$SCRATCH/gen"; then
+    echo "ok: two generations produced byte-identical output"
+  else
+    echo "regen.sh: generation is NOT idempotent (differences above)" >&2
+    exit 1
+  fi
+fi
 
 echo
 echo "Done. Build with:"
