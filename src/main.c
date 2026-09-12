@@ -73,6 +73,7 @@
 #include "keybinds.h"
 #include "host_report.h"
 #include "widescreen.h"
+#include "snesrecomp_rom_identity.h"  /* generated from rom_identity.txt */
 
 
 typedef struct GamepadInfo {
@@ -136,6 +137,36 @@ enum {
 #ifndef SNESRECOMP_BUILD_VERSION
 #define SNESRECOMP_BUILD_VERSION "dev"
 #endif
+
+static int SmHexNibble(char c) {
+  if (c >= '0' && c <= '9') return c - '0';
+  if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+  if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+  return -1;
+}
+
+/* Decode the digests the build generated from rom_identity.txt. Returns 0
+ * when the identity carries none, which callers must read as "cannot verify"
+ * rather than "verified". */
+static int SmRomIdentity(uint8_t sha_out[32], uint32_t *crc_out) {
+  const char *sha = SNESRECOMP_ROM_EXPECTED_SHA256;
+  const char *crc = SNESRECOMP_ROM_EXPECTED_CRC32;
+  if (!sha || strlen(sha) != 64 || !crc || strlen(crc) != 8)
+    return 0;
+  for (int i = 0; i < 32; i++) {
+    int hi = SmHexNibble(sha[i * 2]), lo = SmHexNibble(sha[i * 2 + 1]);
+    if (hi < 0 || lo < 0) return 0;
+    sha_out[i] = (uint8_t)((hi << 4) | lo);
+  }
+  uint32_t v = 0;
+  for (int i = 0; i < 8; i++) {
+    int n = SmHexNibble(crc[i]);
+    if (n < 0) return 0;
+    v = (v << 4) | (uint32_t)n;
+  }
+  *crc_out = v;
+  return 1;
+}
 
 static const char kWindowTitle[] = "Super Metroid (Recompiled)";
 static uint32 g_win_flags = SDL_WINDOW_RESIZABLE;
@@ -221,7 +252,20 @@ static double SmDisplayRefresh(void) {
 static int g_last_drawable_width, g_last_drawable_height;
 static const char *g_active_config_file;
 static int g_sdl_audio_mixer_volume = SNESRECOMP_SDL_MIX_MAXVOLUME;
+/* In-game overlays, framework-owned: the save-state slot browser (Select+R
+ * or [KeyMap] SaveStateMenu) and the local rewind filmstrip ([KeyMap]
+ * Rewind). Both were already linked into every build of this port and
+ * unreachable, because nothing here called them and the forked config.h this
+ * port carried predated their two key-map entries. */
+#include "snes_savestate_menu.h"
+#include "snes_rewind.h"
+#include "snes_overlay_draw.h"
+
 static struct RendererFuncs g_renderer_funcs;
+
+/* Set by the hotkeys; consumed once in the frame loop. */
+static int g_savestate_menu_hotkey;
+static int g_rewind_hotkey;
 
 static GamepadInfo g_gamepad[2];
 
@@ -710,10 +754,79 @@ static void DrawPpuFrameWithPerf(void) {
   if (g_display_perf)
     RenderNumber(pixel_buffer + pitch * render_scale, pitch, g_curr_fps, render_scale == 4);
 
+  /* Overlay panels composite into the frame the presenter is about to take,
+   * rather than into a second texture: this host's presenter is chosen at
+   * runtime (SDL_Renderer or OpenGL), and a texture-level blit would have to
+   * be written once per backend. */
+  {
+    const uint32_t *panel = NULL;
+    int pw = 0, ph = 0;
+    if (snes_savestate_menu_overlay_image(&panel, &pw, &ph) && panel)
+      snes_ovl_blit_panel(pixel_buffer, pitch,
+                          g_snes_width * render_scale,
+                          g_snes_height * render_scale, panel, pw, ph);
+    else if (snes_rewind_overlay_image(&panel, &pw, &ph) && panel)
+      snes_ovl_blit_panel(pixel_buffer, pitch,
+                          g_snes_width * render_scale,
+                          g_snes_height * render_scale, panel, pw, ph);
+  }
+
   SmProfileEnd(kSmProfileCompose, profile_start);
   profile_start = SmProfileStart();
   g_renderer_funcs.EndDraw();
   SmProfileEnd(kSmProfilePresent, profile_start);
+}
+
+/* Seat-0 input word the overlays navigate with — the same sources the guest
+ * gets, minus the script (an overlay is a human facility). */
+static uint32 OverlayNavInputs(void) {
+  return g_input_state | g_pad_buttons | g_gamepad[0].axis_buttons;
+}
+
+/* Modal pump shared by both overlays.
+ *
+ * The guest is FROZEN for the duration: this loop never calls RtlRunFrame,
+ * only re-presents the last rendered field with the panel composited over
+ * it. That is what makes "save right here" mean a definite point in time,
+ * and it is why audio goes quiet while a panel is open.
+ *
+ * `is_open` / `close` / `handle_key` / `poll_nav` are the framework module's;
+ * this function owns only the SDL pumping and the presenting, which is the
+ * division of labour both overlay headers ask for. */
+static void RunOverlayModalLoop(int (*is_open)(void),
+                                void (*close_fn)(void),
+                                void (*handle_key)(int key, int repeat),
+                                void (*poll_nav)(uint32_t inputs, uint32_t ticks),
+                                bool *running) {
+  while (is_open() && *running) {
+    SDL_Event event;
+    while (SDL_PollEvent(&event)) {
+      switch (event.type) {
+      case SDL_QUIT:
+        *running = false;
+        close_fn();
+        break;
+      case SDL_KEYDOWN:
+        /* Straight to the overlay, NOT through HandleInput: the game's own
+         * hotkeys must not fire while a panel owns the screen (F1 would load
+         * a state behind the browser that is asking which state to load). */
+        if (handle_key)
+          handle_key(SNESRECOMP_SDL_EVENT_KEY(event),
+                     SNESRECOMP_SDL_EVENT_REPEAT(event));
+        break;
+      case SDL_KEYUP:
+        /* Keep the keyboard's view of held keys honest so a direction held
+         * across the close does not stick in the guest afterwards. */
+        HandleInput(SNESRECOMP_SDL_EVENT_KEY(event),
+                    SNESRECOMP_SDL_EVENT_MOD(event), false);
+        break;
+      }
+    }
+    if (poll_nav)
+      poll_nav(OverlayNavInputs(), SDL_GetTicks());
+    DrawPpuFrameWithPerf();
+    SDL_Delay(8);
+  }
 }
 
 static SDL_mutex *g_audio_mutex;
@@ -1166,14 +1279,14 @@ int main(int argc, char** argv) {
    * so headered and unheadered dumps both verify against the same hash. */
   static char rom_path_buf[512];
   {
-    /* "Super Metroid (Japan, USA) (En,Ja)" — 3 MiB LoROM, 8 KiB SRAM.
-     * SHA-256 computed locally from the verified unheadered dump. */
-    static const uint8_t kSuperMetroidSha256[32] = {
-      0x12,0xb7,0x7c,0x4b,0xc9,0xc1,0x83,0x2c,
-      0xee,0x88,0x81,0x24,0x46,0x59,0x06,0x5e,
-      0xe1,0xd8,0x4c,0x70,0xc3,0xd2,0x9e,0x6e,
-      0xaf,0x92,0xe6,0x79,0x8c,0xc2,0xca,0x72,
-    };
+    /* Digests come from rom_identity.txt through the generated header, so
+     * this host cannot disagree with the regen, the packaging script or CI
+     * about which dump produced the code it is running. They were a literal
+     * byte array here until 2026-09. */
+    static uint8_t kSuperMetroidSha256[32];
+    static uint32_t kSuperMetroidCrc32;
+    static int rom_identity_ok;
+    rom_identity_ok = SmRomIdentity(kSuperMetroidSha256, &kSuperMetroidCrc32);
     int rom_resolved_by_launcher = 0;
 
 #if defined(SNES_LAUNCHER) || defined(RECOMP_LAUNCHER)
@@ -1260,14 +1373,15 @@ int main(int argc, char** argv) {
         SnesLauncherCGameInfo gi;
         memset(&gi, 0, sizeof(gi));
 #endif
-        gi.name = "Super Metroid";
-        gi.region = "(USA)";
+        gi.name = SNESRECOMP_ROM_DISPLAY_NAME;
+        gi.region = "(" SNESRECOMP_ROM_REGION ")";
         gi.sram_path = "saves/save.srm";  /* SM has battery SRAM — show SAVES panel */
         gi.num_players = 1;
-        gi.expected_crc = 0xD63ED5F8u;
-        gi.has_expected_crc = 1;
-        gi.known_sha256 = &kSuperMetroidSha256;   /* single accepted digest */
-        gi.num_known_sha256 = 1;
+        gi.expected_crc = kSuperMetroidCrc32;
+        gi.has_expected_crc = rom_identity_ok;
+        gi.known_sha256 = rom_identity_ok
+            ? (const uint8_t (*)[32])&kSuperMetroidSha256 : NULL;
+        gi.num_known_sha256 = rom_identity_ok ? 1 : 0;
         gi.widescreen_supported = 0;
 #if defined(RECOMP_LAUNCHER)
         gi.mods = SmModsProvider(&g_sm_video, kSmVideoConfig);
@@ -1328,7 +1442,9 @@ int main(int argc, char** argv) {
     extern int snesrecomp_launcher_resolve_rom_sha256(
         int, char **, char *, size_t, const uint8_t *);
     if (!snesrecomp_launcher_resolve_rom_sha256(la_argc, la_argv, rom_path_buf,
-                                                sizeof(rom_path_buf), kSuperMetroidSha256)) {
+                                                sizeof(rom_path_buf),
+                                                rom_identity_ok ? kSuperMetroidSha256
+                                                                : NULL)) {
       /* User cancelled the picker or repeatedly chose a non-matching ROM. */
       return 1;
     }
@@ -1716,6 +1832,10 @@ error_reading:;
   SmClockReset(&video_clock, SmMonotonicSeconds(), presentation_hz);
   double next_display_check = 0;
 
+  /* Rewind ring: reads the env overrides and reserves slot headers; the
+   * buffer itself is allocated lazily on the first capture. */
+  snes_rewind_configure();
+
   host_report_breadcrumb("entering main loop");
 
   while (running) {
@@ -1878,6 +1998,43 @@ error_reading:;
     uint32 inputs = g_input_state | g_pad_buttons | g_gamepad[0].axis_buttons | g_gamepad[1].axis_buttons << 12;
     inputs |= TickScript();
     inputs |= debug_server_get_controller_inputs();
+
+    /* In-game overlays. Both take seat 0's word before the seat-1 shift,
+     * because they are player-1 facilities.
+     *
+     * The filter masks anything still held when a panel closed until it is
+     * released, so the press that closed the browser neither reaches the
+     * game nor immediately reopens it. */
+    inputs = snes_savestate_menu_filter_guest_input(inputs);
+    if (g_rewind_hotkey && !snes_rewind_is_open() &&
+        !snes_savestate_menu_is_open()) {
+      /* Refused during netplay by snes_rewind_open() itself: one machine
+       * cannot move its own clock backwards while a peer is watching. */
+      if (snes_rewind_open())
+        RunOverlayModalLoop(&snes_rewind_is_open, &snes_rewind_close, NULL,
+                            NULL, &running);
+    }
+    g_rewind_hotkey = 0;
+    /* The Select+R gesture is tested on the HUMAN input word, not on
+     * `inputs`: `inputs` carries TickScript's output, and a scripted repro
+     * that happened to hold Select+R would open a modal panel that the same
+     * script cannot navigate or close (OverlayNavInputs excludes the script
+     * too, deliberately). That is an unattended run wedged forever. */
+    if (g_savestate_menu_hotkey ||
+        snes_savestate_menu_poll_open(OverlayNavInputs())) {
+      g_savestate_menu_hotkey = 0;
+      if (!snes_savestate_menu_is_open())
+        (void)snes_savestate_menu_poll_open(SNES_PAD_SELECT | SNES_PAD_R);
+      if (snes_savestate_menu_is_open()) {
+        RunOverlayModalLoop(&snes_savestate_menu_is_open,
+                            &snes_savestate_menu_close,
+                            &snes_savestate_menu_handle_key,
+                            &snes_savestate_menu_poll_nav, &running);
+        SmRendererReset();
+        g_sm_reset_clock = true;
+        continue;   /* guest was frozen: no frame to run or present */
+      }
+    }
     g_sm_profile_frame = frameCtr + 1;
     if (profile_requested && !g_sm_profile && g_sm_profile_frame >= profile_first) {
       g_sm_profile = true;
@@ -1889,6 +2046,18 @@ error_reading:;
     g_audio_producer_active = paced_realtime && g_audio_device != 0;
     RtlRunFrame(inputs | GetActiveControllers() | debug_server_get_controller_active_mask());
     ApplyScriptForcePokes();
+    /* One guest frame happened: offer it to the rewind ring, and offer the
+     * composited field as the next save's thumbnail. Both are no-ops while a
+     * panel is open, so a thumbnail is of the game and not of the overlay. */
+    snes_rewind_note_frame();
+    if (g_ppu && g_ppu->renderBuffer) {
+      snes_savestate_menu_note_frame((const uint32_t *)g_ppu->renderBuffer,
+                                     SmDisplay_GetCurrentFrameWidth(),
+                                     g_snes_height);
+      snes_rewind_note_framebuffer((const uint32_t *)g_ppu->renderBuffer,
+                                   SmDisplay_GetCurrentFrameWidth(),
+                                   g_snes_height);
+    }
     SmProfileEnd(kSmProfileGuest, profile_start);
     if (audio_probe) {
       profile_start = SmProfileStart();
@@ -2125,6 +2294,8 @@ static void HandleCommand(uint32 j, bool pressed) {
     case kKeys_WindowBigger: ChangeWindowScale(1); break;
     case kKeys_WindowSmaller: ChangeWindowScale(-1); break;
     case kKeys_DisplayPerf: g_display_perf ^= 1; break;
+    case kKeys_SaveStateMenu: g_savestate_menu_hotkey = 1; break;
+    case kKeys_Rewind: g_rewind_hotkey = 1; break;
     case kKeys_ToggleRenderer:
       g_ppu_render_flags ^= kPpuRenderFlags_NewRenderer;
       printf("New renderer = %x\n", g_ppu_render_flags & kPpuRenderFlags_NewRenderer);

@@ -61,9 +61,42 @@ Game-side ctest targets: `sm_display_geometry`, `ppu_widescreen_windows`, `sm_wi
 
 ### Single-fiber frame model (src/sm_rtl.c)
 
-Unlike MMX's multi-slot scheduler, Super Metroid runs as one linear program: reset falls into the main game loop (`$82:8948`), which calls `WaitForNMI` (`$80:8338`) from arbitrary call depth. The whole game therefore runs on ONE host fiber. `WaitForNMI` is HLE-replaced (`bank00.cfg` → body in `src/gen_stubs.c`) with a yield to the host; the host emulates the frame (NMI + PPU), then resumes the fiber, preserving the full C call stack. Architectural register state is saved/restored around each fiber switch. `src/fiber_compat.c` shims Win32 Fibers onto ucontext for macOS/Linux, and onto pthread+condvar handoffs on Android (bionic has no makecontext/swapcontext).
+Unlike MMX's multi-slot scheduler, Super Metroid runs as one linear program: reset falls into the main game loop (`$82:8948`), which calls `WaitForNMI` (`$80:8338`) from arbitrary call depth. The whole game therefore runs on ONE host fiber. `WaitForNMI` is HLE-replaced (`bank00.cfg` → body in `src/gen_stubs.c`) with a yield to the host; the host emulates the frame (NMI + PPU), then resumes the fiber, preserving the full C call stack. Architectural register state is saved/restored around each fiber switch. The Win32 Fiber API is shimmed onto ucontext (macOS/Linux) and onto pthread+condvar handoffs on Android (bionic has no makecontext/swapcontext) by the framework's `desktop/fiber_compat.c`, wired in with `snesrecomp_target_fiber_compat()`. The Android backend originated here and was moved up in 2026-09.
 
-Other game-side runtime: `sm_cpu_infra.c` (game registration consumed by the runner), `sm_spc_player.c` (audio), `post_mortem.c` (crash reporting, see below), `main.c`, `sm_display.c`/`opengl.c`/`glsl_shader.c` (presentation).
+Other game-side runtime: `sm_cpu_infra.c` (game registration consumed by the runner), `sm_spc_player.c` (audio), `sm_post_mortem.c` (the `sm{}` crash-report section, registered through the framework hook), `main.c`, `sm_display.c`/`sm_video.c` (presentation geometry, aspect/HUD policy, the simulation/presentation clock).
+
+### What this port does NOT own
+
+Everything generic now comes from the framework through `snesrecomp_target_*`
+helpers in `CMakeLists.txt`, rather than from a private fork in `src/`:
+
+| Was (deleted 2026-09) | Now |
+|---|---|
+| `src/config.c`, `src/config.h` | `snesrecomp_target_mmx_config()` |
+| `src/post_mortem.c`, `.h` | `snesrecomp_target_post_mortem(TIER2)` |
+| `src/glsl_shader.c`, `.h` | via `snesrecomp_target_opengl()` |
+| `src/opengl.c`, `third_party/gl_core`, `third_party/stb` | `snesrecomp_target_opengl()` |
+| `src/fiber_compat.c`, `.h` | `snesrecomp_target_fiber_compat()` |
+| inline SHA-256/CRC32 in `main.c`, `src/codegen_setup.c` | `snesrecomp_rom_identity()` → `snesrecomp_rom_identity.h`, from `rom_identity.txt` |
+
+The forks were roughly 2,400 lines, some identical to the framework's and some
+ahead of it. What this port was ahead on was moved UP (the Android fiber
+backend, the post-mortem's DB tripwire and stack/dispatch/PPU-DMA dumps, the
+GL presenter itself) rather than deleted. **Do not re-fork these into `src/`**;
+fix them in `snesrecomp/` so every port inherits it.
+
+### In-game overlays
+
+The save-state slot browser (Select+R, or `[KeyMap] SaveStateMenu`) and the
+rewind filmstrip (`[KeyMap] Rewind`) are framework modules
+(`snes_savestate_menu.c`, `snes_rewind.c`). They were linked into every build
+of this port and unreachable until 2026-09, because `main.c` never called them
+and the forked `config.h` predated their two key-map entries. `main.c` now
+wires them: the open gestures read the HUMAN input word only (never
+`TickScript`'s, or a scripted repro could open a modal panel it cannot close),
+and the panels composite into the frame buffer via `snes_ovl_blit_panel()`
+rather than into a second texture — this host's presenter is chosen at runtime
+(SDL_Renderer or OpenGL) and a texture-level blit would need writing twice.
 
 ### Widescreen
 

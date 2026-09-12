@@ -53,7 +53,7 @@ jobs:
           # No ROM in CI, so src/gen/ is empty and the game target cannot
           # link. Compile the host translation units on their own so a syntax
           # or API break still fails the pipeline.
-          for src in src/main.c src/game_rtl.c src/codegen_setup.c; do
+          for src in src/main.c src/sm_rtl.c; do
             echo "  cc $src"
             cc -fsyntax-only -I src -I recomp \
                -I snesrecomp/runner/src -I snesrecomp/runner/src/snes \

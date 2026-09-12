@@ -34,6 +34,15 @@ if(BUILD_TESTING AND NOT ANDROID)
         ${SNESRECOMP_ROOT}/runner/src)
     add_test(NAME sm_display_geometry COMMAND sm_display_test)
 
+    # The overlay compositing step (framework helper, this port's only
+    # consumer of it so far). See the test's header for why it is worth one.
+    add_executable(sm_overlay_blit_test
+        tests/sm_overlay_blit_test.c
+        ${SNESRECOMP_ROOT}/runner/src/snes_overlay_draw.c)
+    target_include_directories(sm_overlay_blit_test PRIVATE
+        ${SNESRECOMP_ROOT}/runner/src)
+    add_test(NAME sm_overlay_blit COMMAND sm_overlay_blit_test)
+
     add_executable(ppu_window_test tests/ppu_window_test.c)
     target_include_directories(ppu_window_test PRIVATE
         ${SNESRECOMP_ROOT}/runner/src)
@@ -180,6 +189,15 @@ endif()
 # bind — the save-state browser and rewind filmstrip were linked into every
 # build and unreachable.
 snesrecomp_target_mmx_config(SuperMetroidSNESRecomp)
+
+# ROM identity. rom_identity.txt is the one place the digests live: this turns
+# it into snesrecomp_rom_identity.h for src/main.c, and tools/regen.sh,
+# scripts/package_release.sh and the release workflow read the same file.
+# Before this call the digests were written out THREE times — here in
+# rom_identity.txt, as a byte array plus a CRC literal in src/main.c, and
+# again in src/codegen_setup.c, whose comment claimed to be the single source
+# of truth. A revision bump is one edit now.
+snesrecomp_rom_identity(SuperMetroidSNESRecomp ${CMAKE_CURRENT_SOURCE_DIR}/rom_identity.txt)
 
 # Crash/exit report. TIER2 adds the interpreter-gap manifest, which this port
 # reads after every run. The "sm" section is registered from src/sm_post_mortem.c
