@@ -791,7 +791,7 @@ static void FillAudioBuffer(Uint8 *stream, int len) {
          * resumes. Retain all native PCM; count the undelivered output just
          * like any other underrun rather than hiding it from diagnostics. */
         memset(g_audiobuffer, 0, g_frames_per_block * g_audio_channels * sizeof(int16));
-        audio_trace_on_output_underflow(available);
+        audio_trace_on_output_underflow(available, g_frames_per_block);
       } else {
         g_audio_primed = true;
         RtlRenderAudio((int16 *)g_audiobuffer, g_frames_per_block, g_audio_channels);
@@ -1700,7 +1700,7 @@ error_reading:;
    * can block behind filesystem/antivirus work and create the very underruns
    * being measured. Longer sessions flush this buffer periodically. */
   if (audio_probe) setvbuf(audio_probe, NULL, _IOFBF, 1024 * 1024);
-  if (audio_probe) fprintf(audio_probe, "frame,seconds,guest_ms,state,door_step,room,master,port_clock,guest_anchor,target_anchor,last_guest,last_target,produced,consumed,underflows,occupancy,dropped,output_rate\n");
+  if (audio_probe) fprintf(audio_probe, "frame,seconds,guest_ms,state,door_step,room,master,port_clock,guest_anchor,target_anchor,last_guest,last_target,produced,consumed,underflows,occupancy,missing_frames,dropped,output_rate\n");
   uint64_t presentations = 0;
   bool profile_requested = getenv("SM_PROFILE") && atoi(getenv("SM_PROFILE")) != 0;
   unsigned profile_first = getenv("SM_PROFILE_START_FRAME")
@@ -1896,7 +1896,7 @@ error_reading:;
       AudioTraceStats st;
       audio_trace_get_stats(&st);
       Apu *apu = g_snes->apu;
-      fprintf(audio_probe, "%d,%.6f,%.3f,%u,%04x,%04x,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%u,%llu,%d\n",
+      fprintf(audio_probe, "%d,%.6f,%.3f,%u,%04x,%04x,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%u,%llu,%llu,%d\n",
           snes_frame_counter, now-run_start, (now-audio_probe_start)*1000,
           g_ram[0x998] | g_ram[0x999]<<8, g_ram[0x99c] | g_ram[0x99d]<<8,
           g_ram[0x79b] | g_ram[0x79c]<<8,
@@ -1905,6 +1905,7 @@ error_reading:;
           (unsigned long long)apu->portTargetAnchor, (unsigned long long)apu->portLastGuest,
           (unsigned long long)apu->portLastTarget, (unsigned long long)st.produced,
           (unsigned long long)st.consumed, (unsigned long long)st.output_underflows, st.occupancy_current,
+          (unsigned long long)st.output_missing_frames,
           (unsigned long long)st.dropped, audio_output_rate);
       SmProfileEnd(kSmProfileAudioTrace, profile_start);
     }
