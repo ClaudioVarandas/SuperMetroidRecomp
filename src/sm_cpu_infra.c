@@ -20,4 +20,9 @@ const RtlGameInfo kSuperMetroidGameInfo = {
   .run_frame = &RunOneFrameOfGame,
   .draw_ppu_frame = &SmDrawPpuFrame,
   .save_name_prefix = "save",
+  /* The guest's position in its own code is this port's fiber call chain, and
+   * a rollback that does not carry it leaves the fiber ahead of the RAM. */
+  .exec_state_bound = &SmExecStateBound,
+  .exec_state_save  = &SmExecStateSave,
+  .exec_state_load  = &SmExecStateLoad,
 };

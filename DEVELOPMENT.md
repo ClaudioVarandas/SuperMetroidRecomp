@@ -536,6 +536,76 @@ BGMODE for one frame during a door transition.
 - `tools/snesref` now builds and runs on Linux (dlopen instead of
   LoadLibrary), so the oracle's frame dumps are available beside the recomp's.
 
+## 2026-09-12 — run-ahead: the picture now comes from the speculation
+
+Asked to check whether run-ahead did anything, it did not. Over 1,195 frames
+the presented picture with `RunAhead = 1` was byte-identical to the picture
+with it off, on the same frame; a working run-ahead shows the frame AFTER.
+Meanwhile it cost 0.7 ms and a 324 KB snapshot save+load per frame, and left
+guest state changed on 21 frames in 1,200.
+
+### Three defects, in order of discovery
+
+1. **The picture was redrawn after the rewind.** `snes_runahead_run_frame`
+   speculated and rewound inside the guest step, but this host draws
+   afterwards, in `draw_ppu_frame` from whatever state the guest is then in --
+   the rewound state. The speculative rendering was thrown away. Proof at the
+   time: raster time per frame was unchanged with the feature on (2.663 vs
+   2.666 ms), so the picture was rasterised exactly once, after the rewind.
+   Run-ahead now takes a capture callback from the host and calls it on the
+   last speculative frame, before rewinding.
+
+2. **The real frame lost its raster side effects.** Moving the capture into
+   the speculation was not enough: this port's raster pass RUNS GUEST CODE --
+   the HUD/room split dispatches the game's own raster IRQ handlers, which
+   write WRAM, and during a door transition move the camera and Samus. With
+   only the speculative pass running, the rewind took those writes away with
+   the speculation. The callback now runs twice: once on the real frame for
+   its side effects (picture discarded, before the snapshot so the writes are
+   inside it), once on the speculated frame for the picture.
+
+3. **The SPC700 was never rewound.** `Apu.portClock` and the port anchors sit
+   deliberately AFTER the region `apu_saveload` serialises -- host-side lead,
+   not machine state -- so a rollback does not put them back. Every
+   speculative frame therefore advanced the audio chip permanently: measured,
+   the SPC had executed 73% more cycles after 232 frames, and the game's
+   sound-effect queue stepped a frame early. Fixed upstream by not driving the
+   APU on a speculative frame at all (`rtl_sync_apu_frame_boundary` is gated
+   on `!g_rtl_speculative_frame`), which is both correct -- that audio is
+   discarded regardless -- and cheaper.
+
+### And the execution position, which had to move too
+
+A guest snapshot holds the machine, not where the game is in its own code.
+This port has two execution models and neither was in a rollback: the LLE
+bridge resume PC (`g_lle_resume_pc`, a static here) and, in the recompiled
+modes, the whole C call chain on the game fiber. New `RtlGameInfo.exec_state_*`
+hooks carry both in the rollback blob (in-process, in-memory, this build only
+-- never a file); `FiberSnapshotSave/Load` in the framework's fiber_compat
+copies a suspended ucontext fiber's live stack and context back to the same
+addresses, so every interior pointer stays valid. Win32 fibers are opaque and
+an Android fiber is a real thread: both report unsupported and run-ahead
+declines there rather than rewinding the machine out from under a fiber that
+stays put. `sm_spc_player`'s ports and APU RAM image ride along, being host
+state the guest talks to.
+
+### Verified
+
+Over a 1,200-frame script, with `RunAhead = 1`: the presented picture equals
+the no-run-ahead run's NEXT frame on 1,196 of 1,198 comparable frames (the
+last frames have no successor), and the per-frame guest state -- WRAM CRC plus
+the CPU register file -- is IDENTICAL on all 1,200. Same at 2 and 4 frames of
+look-ahead (N+2 on 1,196; N+4 on 1,187), and in the `on` and `force` execution
+modes, where the fiber snapshot is the one doing the work and its size tracks
+the guest's call depth. Cost, unpaced: 3.67 ms/frame to 5.73 ms/frame, wall
+clock 5.63 s to 8.44 s for 1,200 frames. That is the honest price of one frame
+of look-ahead -- two guest frames, two raster passes and a ~1.1 MB snapshot
+per displayed frame -- against a 16.6 ms budget.
+
+`snesrecomp/tests/host/fiber_snapshot_test.c` covers the fiber half: a fiber
+suspended several frames deep in a recursion is snapshotted, run forward,
+restored, and must carry on from the restored point.
+
 ## Open items
 
 1. **Next attract blocker** — the f2689 freeze is fixed and the demo now plays

@@ -1,5 +1,6 @@
 #include "sm_rtl.h"
 #include "sm_renderer.h"
+#include "sm_spc_player.h"
 #include "variables.h"
 #include "common_cpu_infra.h"
 #include "snes/snes.h"
@@ -110,6 +111,105 @@ void sm_host_yield(void) {
   sm_save_cpu(&g_game_saved, &g_cpu);
   SwitchToFiber(g_host_fiber);
   sm_restore_cpu(&g_cpu, &g_game_saved);
+}
+
+/* ── Rewindable execution position (rollback snapshots) ──────────────────
+ *
+ * This port's guest is one linear program on ONE host fiber: WaitForNMI
+ * yields from arbitrary call depth, so the game's position in its own code IS
+ * that fiber's C call chain, and no guest snapshot contains it. Rewinding the
+ * machine without it leaves the two out of step -- measured before these
+ * hooks existed, run-ahead's rewind left 21 frames in 1,200 in a state the
+ * game would not otherwise have been in, in bursts around scene changes where
+ * the call depth differs from frame to frame.
+ *
+ * So a rollback snapshot carries the fiber's live stack and context, plus the
+ * register file sm_host_yield parked beside it. In-process, in-memory, this
+ * build only -- exactly the promise RtlRollbackSaveToMemory makes. File
+ * savestates do NOT use these: a stack image is not a thing to write to disk.
+ */
+typedef struct SmExecHeader {
+  uint32_t   magic;
+  uint32_t   version;
+  SmCpuSave  game_saved;
+  uint8_t    game_started;
+  uint8_t    game_done;
+  uint8_t    pad[2];
+  uint32_t   lle_resume_pc;
+  uint32_t   fiber_bytes;
+  uint32_t   spc_bytes;
+} SmExecHeader;
+
+#define SM_EXEC_MAGIC   0x534D4558u  /* 'SMEX' */
+#define SM_EXEC_VERSION 1u
+
+size_t SmExecStateBound(void) {
+  /* No fiber: this frame ran on the interpreter bridge, whose own position is
+   * already in the rollback residue. All that is left is the small header --
+   * and g_lle_resume_pc in it is the thing that actually bit, because it is
+   * where the bridge resumes next frame and speculation moves it. */
+  if (!g_game_fiber) return sizeof(SmExecHeader) + SmSpcPlayer_StateSize();
+  /* A fiber exists, so the call chain in it IS the guest's position. If this
+   * backend cannot copy one, say so with a zero bound rather than let a
+   * rewind put the machine back and leave the fiber where it was. */
+  if (!FiberSnapshotSupported()) return 0;
+  {
+    size_t fiber = FiberSnapshotBound(g_game_fiber);
+    /* A fiber that exists but has never been suspended has nothing live to
+     * copy; the header alone is the whole position. */
+    return sizeof(SmExecHeader) + fiber + SmSpcPlayer_StateSize();
+  }
+}
+
+size_t SmExecStateSave(void *out, size_t capacity) {
+  SmExecHeader hdr;
+  size_t fiber = 0;
+  if (!out || capacity < sizeof(hdr)) return 0;
+  if (g_game_fiber) {
+    if (!FiberSnapshotSupported()) return 0;
+    fiber = FiberSnapshotSave(g_game_fiber, (uint8_t *)out + sizeof(hdr),
+                              capacity - sizeof(hdr));
+    if (!fiber && FiberSnapshotBound(g_game_fiber)) return 0;  /* had one, lost it */
+  }
+  hdr.magic         = SM_EXEC_MAGIC;
+  hdr.version       = SM_EXEC_VERSION;
+  hdr.game_saved    = g_game_saved;
+  hdr.game_started  = g_game_started ? 1u : 0u;
+  hdr.game_done     = g_game_done ? 1u : 0u;
+  hdr.pad[0] = hdr.pad[1] = 0;
+  {
+    size_t spc = SmSpcPlayer_SaveState((uint8_t *)out + sizeof(hdr) + fiber,
+                                       capacity - sizeof(hdr) - fiber);
+    if (SmSpcPlayer_StateSize() && !spc) return 0;
+    hdr.spc_bytes = (uint32_t)spc;
+    hdr.lle_resume_pc = g_lle_resume_pc;
+    hdr.fiber_bytes   = (uint32_t)fiber;
+    memcpy(out, &hdr, sizeof(hdr));
+    return sizeof(hdr) + fiber + spc;
+  }
+}
+
+int SmExecStateLoad(const void *in, size_t size) {
+  SmExecHeader hdr;
+  if (!in || size < sizeof(hdr)) return 0;
+  memcpy(&hdr, in, sizeof(hdr));
+  if (hdr.magic != SM_EXEC_MAGIC || hdr.version != SM_EXEC_VERSION) return 0;
+  if (size < sizeof(hdr) + hdr.fiber_bytes + hdr.spc_bytes) return 0;
+  if (hdr.spc_bytes &&
+      !SmSpcPlayer_LoadState((const uint8_t *)in + sizeof(hdr) + hdr.fiber_bytes,
+                             hdr.spc_bytes))
+    return 0;
+  if (hdr.fiber_bytes) {
+    if (!g_game_fiber) return 0;
+    if (!FiberSnapshotLoad(g_game_fiber, (const uint8_t *)in + sizeof(hdr),
+                           hdr.fiber_bytes))
+      return 0;
+  }
+  g_game_saved    = hdr.game_saved;
+  g_game_started  = hdr.game_started != 0;
+  g_game_done     = hdr.game_done != 0;
+  g_lle_resume_pc = hdr.lle_resume_pc;
+  return 1;
 }
 
 void RunOneFrameOfGame(void) {

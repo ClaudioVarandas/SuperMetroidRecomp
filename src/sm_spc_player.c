@@ -59,6 +59,43 @@ static void SmSpcPlayer_Upload(SpcPlayer *p_in, const uint8_t *data) {
   Dsp_Write(p, FLG, 0x20);
 }
 
+/* Ports first, then the RAM image: everything the guest can observe about the
+ * player. The DSP object hanging off it is audio OUTPUT state, which the
+ * framework deliberately does not rewind (see the DspOutputRing note in
+ * common_rtl.h) -- a rewound output ring would stutter the live audio thread
+ * without changing anything the guest can see. */
+typedef struct SmSpcPlayerState {
+  uint8 input_ports[4];
+  uint8 port_to_snes[4];
+  uint8 ram[65536];
+} SmSpcPlayerState;
+
+size_t SmSpcPlayer_StateSize(void) {
+  return g_spc_player ? sizeof(SmSpcPlayerState) : 0;
+}
+
+size_t SmSpcPlayer_SaveState(void *out, size_t capacity) {
+  SmSpcPlayer *p = (SmSpcPlayer *)g_spc_player;
+  SmSpcPlayerState st;
+  if (!p || !out || capacity < sizeof(st)) return 0;
+  memcpy(st.input_ports, p->base.input_ports, sizeof(st.input_ports));
+  memcpy(st.port_to_snes, p->base.port_to_snes, sizeof(st.port_to_snes));
+  memcpy(st.ram, p->ram, sizeof(st.ram));
+  memcpy(out, &st, sizeof(st));
+  return sizeof(st);
+}
+
+int SmSpcPlayer_LoadState(const void *in, size_t size) {
+  SmSpcPlayer *p = (SmSpcPlayer *)g_spc_player;
+  SmSpcPlayerState st;
+  if (!p || !in || size < sizeof(st)) return 0;
+  memcpy(&st, in, sizeof(st));
+  memcpy(p->base.input_ports, st.input_ports, sizeof(st.input_ports));
+  memcpy(p->base.port_to_snes, st.port_to_snes, sizeof(st.port_to_snes));
+  memcpy(p->ram, st.ram, sizeof(st.ram));
+  return 1;
+}
+
 SpcPlayer *SmSpcPlayer_Create(void) {
   SmSpcPlayer *p = (SmSpcPlayer *)malloc(sizeof(SmSpcPlayer));
   memset(p, 0, sizeof(SmSpcPlayer));
