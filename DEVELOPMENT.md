@@ -504,6 +504,12 @@ snes_sync_master_clock → snes_advance_beam → dma_doHdma → ppu_write`.
 - `src/sm_rtl.c`: `snes_set_hdma_beam_enabled(g_snes, false)` at the top of
   `SmDrawPpuFrame` — this loop is the frame's HDMA engine. Set every frame,
   not once at boot: a save-state load restores the `Snes` struct it lives in.
+- snesrecomp: `SimpleHdma_Init` now infers that declaration, because calling
+  it IS the declaration. Eight ports drive HDMA from their own raster loop
+  (`MegaManX`, `MetalWarriors`, `StarFox`, `SuperMarioWorld`, `SuperSmashWorld`,
+  `ZeldaAlttP`, the `SuperMetroidSNESRecomp` scaffold and this one) and none of
+  them had said so, so all eight had the same exposure. The explicit call above
+  is kept as documentation; removing it renders identically.
 
 ### Verified
 
