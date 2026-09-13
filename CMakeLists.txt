@@ -137,12 +137,11 @@ endif()
 # already expose the same knob.
 set(SM_GEN_DIR "${CMAKE_CURRENT_SOURCE_DIR}/src/gen" CACHE PATH
     "Directory containing the private generated Super Metroid C sources")
-file(GLOB SM_GEN_SOURCES CONFIGURE_DEPENDS ${SM_GEN_DIR}/*.c)
-if(NOT SM_GEN_SOURCES)
-    message(FATAL_ERROR
-        "${SM_GEN_DIR} is empty — run the regen (see header) with a verified "
-        "Super Metroid ROM at the repo root before building.")
-endif()
+# Added to the target by snesrecomp_target_generated_code() below, once the
+# target exists. That helper owns both outcomes: the generated C when it is
+# there, and -- only with -DSNESRECOMP_SETUP_HOST=ON -- the setup-host
+# dispatch tables when it is not. An empty src/gen without that option stays
+# the hard error it has always been, in the framework's words.
 
 # What this port actually owns.
 #
@@ -159,7 +158,6 @@ set(SM_HOST_SOURCES
     # game-specific runtime
     src/main.c            # host shim: identity + this title's hooks
     src/sm_rtl.c          # THE PORT: single-fiber frame model, NMI/IRQ, HDMA
-    src/gen_stubs.c       # hand-written bodies for hle_func/hle_dispatch
     src/sm_cpu_infra.c    # RtlGameInfo registration
     src/sm_post_mortem.c  # the "sm" crash-report section (framework hook)
     src/sm_spc_player.c   # SPC upload interception
@@ -168,8 +166,6 @@ set(SM_HOST_SOURCES
     src/sm_display.c      # SM presentation geometry
     src/sm_video.c        # SM aspect/HUD policy + presentation clock
     src/sm_mods.c         # built-in presentation mod provider
-    # recompiled banks (generated)
-    ${SM_GEN_SOURCES}
 )
 
 if(ANDROID)
@@ -181,8 +177,16 @@ else()
 endif()
 
 
+# NOT the repo root. The root holds VERSION, and on a case-insensitive
+# filesystem (Windows, and macOS by default) an -I of the root makes libc++'s
+# `#include <version>` resolve to that file instead of the standard header --
+# the compiler then reads "0.1.0" as C++ and the build dies inside <cmath>.
+# Nothing here includes anything root-relative; keep it off the search path.
+# snesrecomp_target_desktop_host() arms the framework's
+# snesrecomp_guard_header_shadowing(), which refuses to configure if any
+# include directory grows such a file again -- on Linux too, so it is caught
+# here rather than in Windows CI.
 target_include_directories(SuperMetroidSNESRecomp PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${CMAKE_CURRENT_SOURCE_DIR}/recomp
     ${SNESRECOMP_RUNNER_INCLUDE_DIRS}
@@ -211,6 +215,18 @@ endif()
 # hooks. Before 2026-09 all of it was a 2,800-line private copy of the host in
 # src/main.c, ahead of the framework's in places and behind it in others.
 snesrecomp_target_desktop_host(SuperMetroidSNESRecomp TIER2)
+# The recompiled banks, or the setup host when there are none and the build
+# asked for one. The release workflow builds exactly that: CI has no ROM, so
+# it cannot generate, and what it can honestly ship is a setup pack whose
+# launcher regenerates on the player's machine.
+snesrecomp_target_generated_code(SuperMetroidSNESRecomp ${SM_GEN_DIR})
+# gen_stubs.c holds this port's hand-written bodies for hle_func targets. They
+# are part of the recompiled code's surface -- they call into generated banks
+# and are called from them -- so they belong to the same build as src/gen and
+# not to a setup host, which has neither.
+if(NOT SNESRECOMP_SETUP_HOST)
+    target_sources(SuperMetroidSNESRecomp PRIVATE src/gen_stubs.c)
+endif()
 # rom.cfg at the repo root (git-ignored, the ROM's absolute path) is staged
 # beside the executable when none is there yet, so a launch opens on it.
 snesrecomp_target_rom_cache(SuperMetroidSNESRecomp)

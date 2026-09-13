@@ -635,6 +635,47 @@ rewind ring every frame (that is the repeated "[snes_rewind] 60 snapshots
 every 6 frames"). Rewind kept no history at all while run-ahead was on. Also
 fixed upstream, by carrying the state generation across a rollback.
 
+## 2026-09-12 — CI is the shared release workflow now, and this port can build a setup host
+
+`.github/workflows/release.yml` was a per-repo file that built nothing
+releasable: with no ROM in CI there is no `src/gen`, so it compiled two
+translation units with `cc -fsyntax-only` and published a release with notes
+and no artifacts. It is now the wizard's `templates/release.yml.in` rendered
+for this game (`Super Metroid`, `SuperMetroidSNESRecomp`, `supermetroid`),
+byte-identical to what `tools/new_project` emits — human-triggered only, four
+platforms, version resolution from tags or `VERSION`, tag-after-build, and
+setup packs with SHA256SUMS.
+
+Two things had to follow it, because a workflow that calls scripts this port
+does not have is not a deliverable:
+
+- `scripts/package_release.sh` is the template's too. The old one packaged the
+  *game* executable from `build/` and took no arguments; the workflow passes a
+  build directory, a platform tag and `--embed-toolchain`, and expects a setup
+  pack named `supermetroid-<version>-<platform>.zip`. The only local edit is
+  the absence of `--runtime-dir mods`: this port has no mod catalog (its
+  presentation mods are compiled in, `src/sm_mods.c`), and the staging tool
+  fails loudly on a named directory that is not there.
+
+- The port can now build with `-DSNESRECOMP_SETUP_HOST=ON`, which is what the
+  workflow builds. `CMakeLists.txt` routes `src/gen` through
+  `snesrecomp_target_generated_code()` instead of globbing it into the source
+  list, so the framework owns both outcomes; `src/gen_stubs.c` joins the build
+  only when there is generated code to go with it. `src/sm_rtl.c` was the one
+  file coupled to the generated tree — it includes `funcs.h` and calls
+  `I_RESET` / `I_NMI` / `I_IRQ` — and those are behind
+  `#if defined(SNESRECOMP_SETUP_HOST)`, replaced by bodies that name the entry
+  point and abort. Unreachable by construction: `SnesInit()` refuses to boot a
+  guest in a setup host, so the only path through that binary is the
+  launcher's Generate & rebuild.
+
+Verified locally end to end: the setup host configures, builds and packages
+(`dist/supermetroid-0.1.0-linux-x64.zip`, 16.6 MB, no `.sfc`, no `src/gen`, no
+`funcs.h` in it); `-DSNESRECOMP_SETUP_HOST=ON` against a tree that still has
+generated C is refused by the framework, as it should be; and the ordinary
+build is unchanged — ctest 8/8 and a 1,200-frame guest trace byte-identical to
+before the change.
+
 ## Open items
 
 1. **Next attract blocker** — the f2689 freeze is fixed and the demo now plays
