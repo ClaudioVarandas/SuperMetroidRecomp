@@ -6,7 +6,29 @@
 #include "snes/snes.h"
 #include "cpu_state.h"
 #include "execution_mode.h"
+#if defined(SNESRECOMP_SETUP_HOST)
+/* A SETUP HOST is this host without recompiled code, so there is no funcs.h
+ * to include and no I_RESET / I_NMI / I_IRQ to call. It also never runs a
+ * guest: SnesInit() refuses to boot one when this is defined, and the only
+ * path through that binary is the launcher's Generate & rebuild wizard, which
+ * replaces it with a real build from the player's own ROM.
+ *
+ * These are not stubs in the sense the rules forbid -- none of them invents a
+ * result to get past a gap. They exist so the link resolves, and each one is
+ * unreachable; if the wiring ever changes and one IS reached, it says which
+ * entry point and stops, rather than pretending the guest ran. */
+static void sm_no_recompiled_code(const char *what) {
+  fprintf(stderr,
+          "[sm_rtl] %s called in a setup host: this binary carries no "
+          "recompiled code and cannot run the guest.\n", what);
+  abort();
+}
+#define I_RESET(cpu) ((void)(cpu), sm_no_recompiled_code("I_RESET"))
+#define I_NMI(cpu)   ((void)(cpu), sm_no_recompiled_code("I_NMI"))
+#define I_IRQ(cpu)   ((void)(cpu), sm_no_recompiled_code("I_IRQ"))
+#else
 #include "funcs.h"
+#endif
 #include "snes/interp_bridge.h"
 #include <stdint.h>
 #include <stdio.h>
