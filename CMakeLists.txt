@@ -177,8 +177,16 @@ else()
 endif()
 
 
+# NOT the repo root. The root holds VERSION, and on a case-insensitive
+# filesystem (Windows, and macOS by default) an -I of the root makes libc++'s
+# `#include <version>` resolve to that file instead of the standard header --
+# the compiler then reads "0.1.0" as C++ and the build dies inside <cmath>.
+# Nothing here includes anything root-relative; keep it off the search path.
+# snesrecomp_target_desktop_host() arms the framework's
+# snesrecomp_guard_header_shadowing(), which refuses to configure if any
+# include directory grows such a file again -- on Linux too, so it is caught
+# here rather than in Windows CI.
 target_include_directories(SuperMetroidSNESRecomp PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${CMAKE_CURRENT_SOURCE_DIR}/recomp
     ${SNESRECOMP_RUNNER_INCLUDE_DIRS}
