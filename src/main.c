@@ -218,6 +218,7 @@ static const SnesDesktopHostGame kSuperMetroidHost = {
   .debug_port = 4380,
   .widescreen_supported = 0,       /* widescreen is this title's Mods page */
   .msu1_supported = 0,
+  .shader_supported = 1,
   .simulation_hz = SM_SIMULATION_HZ,
   .frame_width = 256,
   .frame_height = SM_HEIGHT,

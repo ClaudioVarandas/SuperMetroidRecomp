@@ -309,3 +309,12 @@ target_sources(SuperMetroidSNESRecomp PRIVATE
 target_include_directories(SuperMetroidSNESRecomp PRIVATE
     ${SNESRECOMP_ROOT}/host
     ${RECOMP_UI_ROOT}/src)
+
+# GLSL shader presets (CRT/scanlines) for the OpenGL desktop backend. The
+# launcher's shader dropdown scans assets/shaders beside the executable for
+# *.glsl/*.glslp; src/main.c opts this game into that row.
+if(NOT ANDROID)
+    snesrecomp_target_stage_dir(SuperMetroidSNESRecomp
+        ${CMAKE_CURRENT_SOURCE_DIR}/assets/shaders
+        assets/shaders)
+endif()

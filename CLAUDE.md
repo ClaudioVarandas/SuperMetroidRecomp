@@ -89,7 +89,8 @@ fix them in `snesrecomp/` so every port inherits it.
 
 The save-state slot browser (Select+R on the pad, or `[KeyMap] SaveStateMenu`,
 F11) and the rewind filmstrip (`[Controller] RewindGesture`, Select+R3 by
-default, or `[KeyMap] Rewind`, F12) are framework modules driven by the
+default, or `[KeyMap] Rewind`, Shift+F12 — plain F12 became `Screenshot`
+when the shader/screenshot work landed) are framework modules driven by the
 framework host. The guest is frozen while a panel is up; the host presents the
 last frame with the panel composited at 512x448 and never runs guest code from
 a modal loop. Two bugs this port shipped and that now have tests: the modal
