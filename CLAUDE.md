@@ -57,7 +57,7 @@ Game-side ctest targets: `sm_display_geometry`, `ppu_widescreen_windows`, `sm_wi
 
 ### Generation pipeline
 
-`recomp/bankXX.cfg` files carry per-bank directives: `func <Name> <pc> end:<next>` boundaries (harvested from the snesrev/sm decomp — the symbol/behavior ground truth), `hle_func` (route a PC to a hand-written C body), and `indirect_dispatch` (authorize `JSR (abs,X)`-style indirect calls with enumerated targets; dispatch target tables come from `recomp/sm_decomp_symbols.json`). `tools/regen.sh` drives `snesrecomp/tools/v2_emit.py` with the runtime profile `profiles/attract_tier2.json` (selects observed AOT work) and syncs `recomp/funcs.h`. This worktree no longer applies guest widescreen overrides. Unauthorized indirect calls with WRAM pointer bases become runtime dispatches through `cpu_dispatch_*` in the runner.
+`recomp/bankXX.cfg` files carry per-bank directives: `func <Name> <pc> end:<next>` boundaries (harvested from the snesrev/sm decomp — the symbol/behavior ground truth), `hle_func` (route a PC to a hand-written C body), and `indirect_dispatch` (authorize `JSR (abs,X)`-style indirect calls with enumerated targets; dispatch target tables come from `recomp/sm_decomp_symbols.json`). `tools/regen.sh` drives `snesrecomp/tools/v2_emit.py` with `--cfg-roots` (every cfg `func` declaration is an analysis root) and syncs `recomp/funcs.h`. **That default exists to match what a player's regen does** — the in-launcher "Generate & rebuild" wizard (`snesrecomp_codegen_host_autowire()`) hardcodes `--cfg-roots` and cannot pass a profile manifest at all, and CI only ever builds a setup host, so a dev default that differed meant the only configuration anyone ships was the one nobody built. `profiles/attract_tier2.json` is now opt-in (`--profile-manifest profiles/attract_tier2.json`) for the tier-2 burn-down loop; it adds ~278 AOT variants a player's tree does not have, so do not benchmark or ship a tree built with it without saying so. This worktree no longer applies guest widescreen overrides. Unauthorized indirect calls with WRAM pointer bases become runtime dispatches through `cpu_dispatch_*` in the runner.
 
 ### Single-fiber frame model (src/sm_rtl.c)
 
@@ -89,7 +89,8 @@ fix them in `snesrecomp/` so every port inherits it.
 
 The save-state slot browser (Select+R on the pad, or `[KeyMap] SaveStateMenu`,
 F11) and the rewind filmstrip (`[Controller] RewindGesture`, Select+R3 by
-default, or `[KeyMap] Rewind`, F12) are framework modules driven by the
+default, or `[KeyMap] Rewind`, Shift+F12 — plain F12 became `Screenshot`
+when the shader/screenshot work landed) are framework modules driven by the
 framework host. The guest is frozen while a panel is up; the host presents the
 last frame with the panel composited at 512x448 and never runs guest code from
 a modal loop. Two bugs this port shipped and that now have tests: the modal
@@ -110,6 +111,7 @@ gaps. Full regeneration remains mandatory after changing generation inputs.
 
 ### Debugging workflow
 
+- `python3 snesrecomp/tools/check_link_closure.py src/gen` reports whether a generated tree will link — every `<Name>_M<m>X<x>` it calls is defined — in seconds, without building. `regen.sh` runs this automatically before publishing, so a fresh regen needs it only for a tree generation does not own: one a player produced through the launcher, or one attached to a bug report.
 - `build/last_run_report.json` is the always-on post-mortem written on crash/exit: CPU state, recomp stack, abandons, tier2 coverage, dispatch-log ring, DB/PB ring, and an SM-specific `sm{}` section (game_state, enemy slots). It is the primary crash-diagnosis artifact — the TCP debug server is not usable for SM.
 - Differential oracle: `snesrecomp/tools/snesref` (headless snes9x libretro, per-frame WRAM trace via `SNESREF_FRAMES`/`SNESREF_TRACE_FILE`, frame dumps via `SNESREF_FRAME_DUMP_DIR`); build it with `tools/snesref/build.sh` on Linux and point it at any libretro SNES core. Recomp side traces via `SNESRECOMP_WRAM_TRACE_FILE`. Whole-WRAM traces don't align frame-for-frame — diff a single semantic variable's timeline instead (e.g. game_state `$0998`).
 - The `EnableSnes9xOracle` runtime option only makes sense from boot (it can't follow save-state loads); see the warning in `config.ini`.
